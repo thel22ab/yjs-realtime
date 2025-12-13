@@ -10,8 +10,10 @@
 2. [Implementation Steps](#2-implementation-steps)
 3. [State Management Deep Dive](#3-state-management-deep-dive)
 4. [Data Flow & Synchronization](#4-data-flow--synchronization)
-5. [Challenges & Solutions](#5-challenges--solutions-the-gotchas)
-6. [Final Recommendations](#6-final-recommendations-for-students)
+5. [Sidecar Architecture Patterns](#5-sidecar-architecture-patterns)
+6. [Challenges & Solutions](#6-challenges--solutions-the-gotchas)
+7. [Final Recommendations](#7-final-recommendations-for-students)
+8. [Offline Editing](#8-offline-editing)
 
 ---
 
@@ -271,7 +273,152 @@ Yjs uses **CRDTs (Conflict-free Replicated Data Types)** to handle concurrent ed
 
 ---
 
-## 5. Challenges & Solutions (The "Gotchas")
+## 5. Sidecar Architecture Patterns
+
+As your collaborative application grows, you'll need to think about **scaling** and **deployment patterns**. The "sidecar architecture" is a common approach where a specialized, independent service handles real-time synchronization separately from your main application.
+
+### What is a Sidecar?
+
+In our implementation, the WebSocket server embedded in `server.js` *is* effectively a sidecar — it's a distinct responsibility that could be extracted into its own service. The sidecar pattern allows your main application to remain decoupled from real-time data handling complexities.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        PRODUCTION ARCHITECTURE                        │
+│                                                                        │
+│  ┌────────────────┐       ┌────────────────────────────────────┐     │
+│  │   Next.js App  │       │        Yjs Sidecar Service         │     │
+│  │   (Stateless)  │       │  ┌──────────────────────────────┐ │     │
+│  │                │       │  │    WebSocket Server          │ │     │
+│  │  • Pages       │       │  │    (y-websocket or custom)   │ │     │
+│  │  • API Routes  │       │  └──────────────┬───────────────┘ │     │
+│  │  • Server      │       │                 │                  │     │
+│  │    Actions     │       │  ┌──────────────▼───────────────┐ │     │
+│  └───────┬────────┘       │  │    Persistence Layer         │ │     │
+│          │                │  │    (Redis, Postgres, S3)     │ │     │
+│          │ HTTP           │  └──────────────────────────────┘ │     │
+│          ▼                └─────────────────┬──────────────────┘     │
+│  ┌───────────────┐                          │ WebSocket               │
+│  │   Database    │◄─────────────────────────┘                        │
+│  │   (Metadata)  │                                                    │
+│  └───────────────┘                                                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Network Provider Options
+
+#### Option 1: WebSocket Server (What We Built)
+
+This is the most common approach — a centralized server relays updates between clients:
+
+| Pros | Cons |
+|------|------|
+| Simple authentication | Single point of failure |
+| Works behind firewalls | Requires server infrastructure |
+| Easy to add persistence | Latency depends on server location |
+| Horizontally scalable via room sharding | |
+
+**Scaling Strategy**: Shard by "room" (document ID). Each server instance handles a subset of documents. Use Redis pub/sub to coordinate if a user needs to access a document on another shard.
+
+#### Option 2: WebRTC (Peer-to-Peer)
+
+With `y-webrtc`, clients communicate directly:
+
+```bash
+npm install y-webrtc
+```
+
+```typescript
+import { WebrtcProvider } from 'y-webrtc';
+
+const provider = new WebrtcProvider('my-room', ydoc, {
+  signaling: ['wss://signaling.yjs.dev'], // Still need signaling server
+});
+```
+
+| Pros | Cons |
+|------|------|
+| Minimal server infrastructure | NAT traversal can fail |
+| Lower latency (direct connection) | Limited room size (~10-20 peers) |
+| Better privacy | No built-in persistence |
+| Good for small teams | Harder to debug |
+
+> **Note**: Even WebRTC needs a lightweight **signaling server** to help peers discover each other. This is still a sidecar, just a much smaller one.
+
+### Persistence Provider Options
+
+For production, you'll want durable storage beyond SQLite:
+
+| Provider | Use Case | Package |
+|----------|----------|---------|
+| **IndexedDB** | Client-side offline cache | `y-indexeddb` |
+| **Redis** | High-speed server-side cache | `y-redis` |
+| **PostgreSQL** | Relational DB integration | `y-postgres` |
+| **MongoDB** | Document store | `y-mongodb` |
+| **LevelDB** | Embedded key-value | `y-leveldb` |
+| **S3/Cloud Storage** | Long-term archival | Custom implementation |
+
+**Hybrid Pattern**: Use IndexedDB on the client for offline support, and PostgreSQL on the server for durability:
+
+```typescript
+// Client-side
+import { IndexeddbPersistence } from 'y-indexeddb';
+
+const indexeddbProvider = new IndexeddbPersistence(docName, ydoc);
+indexeddbProvider.on('synced', () => {
+  console.log('Loaded from IndexedDB (offline cache)');
+});
+```
+
+### Managed Solutions (No Sidecar to Maintain)
+
+If managing your own sidecar feels like too much, several services provide hosted Yjs backends:
+
+| Service | Description | Best For |
+|---------|-------------|----------|
+| **[Hocuspocus](https://hocuspocus.dev)** | Open-source extensible Node.js server | Self-hosting with plugins |
+| **[PartyKit](https://partykit.io)** | Serverless on Cloudflare's edge | Global low-latency apps |
+| **[Liveblocks](https://liveblocks.io)** | Fully managed with React hooks | Rapid development |
+| **[Y-Sweet](https://github.com/jamsocket/y-sweet)** | Standalone Yjs server with S3 persistence | Simple self-hosting |
+
+**Example: Hocuspocus Server**
+
+```typescript
+// hocuspocus-server.ts
+import { Server } from '@hocuspocus/server';
+import { SQLite } from '@hocuspocus/extension-sqlite';
+
+const server = Server.configure({
+  port: 1234,
+  extensions: [
+    new SQLite({ database: 'db.sqlite' }),
+  ],
+  async onAuthenticate({ token }) {
+    // Verify JWT or API key
+    if (!isValidToken(token)) throw new Error('Unauthorized');
+  },
+});
+
+server.listen();
+```
+
+### When to Extract the Sidecar
+
+Our current `server.js` approach (combined Next.js + WebSocket) works great for:
+
+- ✅ Small to medium scale (< 1000 concurrent connections)
+- ✅ Single server deployments
+- ✅ Simplified development and debugging
+
+Consider extracting to a separate sidecar when:
+
+- ❌ You need to scale Next.js and WebSocket servers independently
+- ❌ You're deploying to serverless (Vercel, Netlify) where WebSockets don't work natively
+- ❌ You need geographic distribution (edge deployment)
+- ❌ You want different teams to own different services
+
+---
+
+## 6. Challenges & Solutions (The "Gotchas")
 
 ### Issue 1: The `ws` Module
 
@@ -340,7 +487,7 @@ server.on('upgrade', (request, socket, head) => {
 
 ---
 
-## 6. Final Recommendations for Students
+## 7. Final Recommendations for Students
 
 ### Getting Started
 
@@ -378,6 +525,71 @@ When following tutorials, pay close attention to library versions. The JS ecosys
 - [ ] Add connection retry logic with exponential backoff
 - [ ] Monitor WebSocket connection counts
 - [ ] Set up database backups for SQLite file
+
+---
+
+## 8. Offline Editing
+
+To enable offline support, we use `y-indexeddb` to cache the Yjs document in the browser's IndexedDB. This provides a seamless experience where:
+
+1. **Instant Load**: Data loads from IndexedDB immediately, even before the WebSocket connects
+2. **Offline Editing**: Users can continue working when disconnected
+3. **Automatic Sync**: Changes merge automatically when reconnected
+
+### Installation
+
+```bash
+npm install y-indexeddb
+```
+
+### Implementation
+
+```typescript
+import { IndexeddbPersistence } from 'y-indexeddb';
+
+// Inside your useEffect:
+const doc = new Y.Doc();
+const wsProvider = new WebsocketProvider(wsUrl, documentId, doc);
+
+// Add IndexedDB persistence
+const indexeddbProvider = new IndexeddbPersistence(documentId, doc);
+indexeddbProvider.on('synced', () => {
+  console.log('Loaded from IndexedDB');
+  setOfflineReady(true);
+});
+
+// Cleanup
+return () => {
+  indexeddbProvider.destroy();
+  wsProvider.destroy();
+  doc.destroy();
+};
+```
+
+### UI States
+
+With offline support, update your UI to reflect the connection state:
+
+| State | Condition | Display |
+|-------|-----------|--------|
+| Loading | `!connected && !offlineReady` | "Connecting..." spinner |
+| Offline | `!connected && offlineReady` | Amber "Offline Mode" badge |
+| Online | `connected` | Green "Synchronized" badge |
+
+### How Sync Works
+
+```
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│   IndexedDB     │◀───────▶│    Y.Doc        │◀───────▶│   WebSocket     │
+│  (Local Cache)  │  sync   │  (In Memory)    │  sync   │   (Server)      │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+        ▲                                                        │
+        │                  Offline? Still works!                 │
+        └────────────────────────────────────────────────────────┘
+                            Reconnect? Auto-merges!
+```
+
+Both providers sync with the same `Y.Doc`. When offline, IndexedDB preserves all changes. When reconnected, Yjs's CRDT magic merges everything automatically.
 
 ---
 
