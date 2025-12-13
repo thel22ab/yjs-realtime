@@ -79,6 +79,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                 availability: (ciaMap.get('availability') as string) || 'Low',
             });
         };
+        // Using observer pattern to update local state when remote changes arrive 'Observe all events that are created on this type.
         ciaMap.observe(updateLocalCia);
 
         // Create ProseMirror editor state

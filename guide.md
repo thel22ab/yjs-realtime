@@ -42,7 +42,7 @@ Standard Next.js Server Actions are great for request/response flows, but real-t
 We started by installing the core dependencies:
 
 ```bash
-npm install yjs y-websocket@1.5.4 better-sqlite3 ws
+npm install yjs y-websocket @y/websocket-server better-sqlite3 ws
 ```
 
 The critical piece was `server.js`. This file replaces the standard `next start` command. It initializes Next.js but also listens for WebSocket upgrades.
@@ -53,7 +53,7 @@ The critical piece was `server.js`. This file replaces the standard `next start`
 // server.js
 const { createServer } = require('http');
 const { WebSocketServer } = require('ws');
-const { setupWSConnection } = require('y-websocket/bin/utils');
+const { setupWSConnection } = require('@y/websocket-server/utils');
 // ... Next.js setup ...
 
 app.prepare().then(() => {
@@ -110,31 +110,75 @@ setupWSConnection(ws, req, {
 
 ### Step 3: The Frontend Editor
 
-We didn't use a rich text editor like ProseMirror. Instead, we built a custom form editor using **Yjs primitives**:
+We built a custom form editor combining **Yjs primitives** with **ProseMirror**:
 
 - **`Y.Map`** for the CIA dropdowns (Confidentiality, Integrity, Availability)
-- **`Y.Text`** for the Notes field
+- **`Y.XmlFragment`** with **ProseMirror** for the Notes field
 
-**Key Code: Binding Data**
+#### Why ProseMirror Even for a Simple Notes Field?
+
+Initially, we tried using a plain `<textarea>` with `Y.Text`. The problem? Standard textareas don't provide character-level change events — only the full value after each keystroke. This forced us to "delete all and re-insert" on every change:
 
 ```typescript
-// RiskAssessmentEditor.tsx
-useEffect(() => {
-  const doc = new Y.Doc();
-  const provider = new WebsocketProvider(url, docId, doc);
+// ❌ BAD: Naive textarea approach (defeats CRDT purpose)
+ydoc.transact(() => {
+  notesText.delete(0, notesText.length);
+  notesText.insert(0, newValue);
+});
+```
 
-  // Sync Map (Dropdowns)
-  const ciaMap = doc.getMap('cia');
-  ciaMap.observe(() => {
-    // Update React state when Yjs data changes
-    setCia(ciaMap.toJSON());
+This effectively becomes **Last Write Wins** for the entire text block, losing the character-level merging that makes CRDTs valuable.
+
+**ProseMirror solves this** by providing granular transaction-level changes that map perfectly to Yjs operations. The `y-prosemirror` binding handles this automatically:
+
+```typescript
+import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
+import { exampleSetup } from 'prosemirror-example-setup';
+
+// Y.XmlFragment instead of Y.Text for ProseMirror
+const yXmlFragment = ydoc.getXmlFragment('prosemirror');
+
+const state = EditorState.create({
+  schema,
+  plugins: [
+    ySyncPlugin(yXmlFragment),      // Syncs ProseMirror ↔ Yjs
+    yCursorPlugin(awareness),        // Shows remote cursors
+    yUndoPlugin(),                   // Undo YOUR changes only
+    ...exampleSetup({ schema })
+  ]
+});
+
+const view = new EditorView(editorRef.current, { state });
+```
+
+#### Benefits of ProseMirror + y-prosemirror
+
+| Feature | Plain Textarea | ProseMirror |
+|---------|----------------|-------------|
+| **Merge concurrent edits** | ❌ Last Write Wins | ✅ Character-level CRDT |
+| **Remote cursors** | ❌ Not possible | ✅ See where others are typing |
+| **Collaborative undo** | ❌ Global undo | ✅ Undo only your changes |
+| **Offline editing** | ✅ Works | ✅ Works (same IndexedDB) |
+| **Bundle size** | ~0 KB | ~80 KB |
+
+The ~80KB cost is worth it for **true collaborative editing** where two users can type in the same paragraph simultaneously without conflicts.
+
+**Key Code: CIA Dropdowns (Y.Map)**
+
+```typescript
+// Still using Y.Map for simple key-value fields
+const ciaMap = ydoc.getMap('cia');
+ciaMap.observe(() => {
+  setCia({
+    confidentiality: ciaMap.get('confidentiality') || 'Low',
+    integrity: ciaMap.get('integrity') || 'Low',
+    availability: ciaMap.get('availability') || 'Low',
   });
+});
 
-  // Update Yjs when User changes input
-  const handleChange = (key, value) => {
-    ciaMap.set(key, value); // Propagates to all users
-  };
-}, []);
+const handleCiaChange = (field, value) => {
+  ciaMap.set(field, value); // Propagates to all users
+};
 ```
 
 ---
@@ -434,21 +478,37 @@ npm install ws
 
 ---
 
-### Issue 2: The `y-websocket` Version Mismatch
+### Issue 2: The `y-websocket` Server Utilities
 
-**Problem**: We initially encountered `Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './bin/utils'`.
+**Problem**: You might encounter `Error [ERR_PACKAGE_PATH_NOT_EXPORTED]: Package subpath './bin/utils'` when trying to import `setupWSConnection`.
 
-**Context**: We were trying to import `setupWSConnection` from `y-websocket/bin/utils`.
+**Context**: Historically, tutorials recommended importing `setupWSConnection` from `y-websocket/bin/utils`. This was always a bit fragile because `bin/` paths aren't meant for external consumption.
 
-**Root Cause**: `y-websocket` v2.0+ and especially v3.0+ changed their package exports strategies. The utility scripts located in `bin/` were no longer exported for external consumption.
+**Root Cause**: As of `y-websocket@3.0.0` (April 2025), the server-side utilities have been **officially extracted** into a separate package: `@y/websocket-server`. This package now lives in its own [repository](https://github.com/yjs/y-websocket-server) and is the recommended way to build custom Yjs WebSocket servers.
 
-**Solution**: We downgraded to v1.5.4.
+**Solution**: Install the new server package:
 
 ```bash
-npm install y-websocket@1.5.4
+npm install @y/websocket-server
 ```
 
-> **Recommendation**: For new projects, check the latest `y-websocket` documentation. If building a custom server, you might need to copy the `utils.js` logic into your own project if the library author completely hides it in future versions.
+Then import from the new location:
+
+```javascript
+// ✅ NEW (recommended)
+const { setupWSConnection, setPersistence } = require('@y/websocket-server/utils');
+
+// ❌ OLD (no longer works in y-websocket@2.0+)
+// const { setupWSConnection } = require('y-websocket/bin/utils');
+```
+
+**Why the split?** The `y-websocket` package is now purely a **client-side** WebSocket provider ($0$ server dependencies), while `@y/websocket-server` handles the **server-side** connection management. This separation:
+
+- Reduces bundle size for client-only apps
+- Makes the server code forkable and customizable
+- Provides cleaner exports without relying on internal paths
+
+> **Note**: If you find older tutorials recommending `y-websocket@1.5.4` to access `bin/utils`, that workaround is now outdated. Use `@y/websocket-server` instead.
 
 ---
 
@@ -510,13 +570,16 @@ Saving on every keystroke (as we did) works for demos. For high-scale apps:
 When following tutorials, pay close attention to library versions. The JS ecosystem moves fast, and major version bumps often break internal imports.
 
 ```json
-// Recommended versions (as of this guide)
+// Recommended versions (as of December 2025)
 {
   "yjs": "^13.6.x",
-  "y-websocket": "1.5.4",
-  "better-sqlite3": "^11.x"
+  "y-websocket": "^3.0.0",
+  "@y/websocket-server": "^0.1.1",
+  "better-sqlite3": "^12.x"
 }
 ```
+
+> **Note**: `y-websocket` is now the client-only WebSocket provider. For server-side utilities like `setupWSConnection`, use `@y/websocket-server`.
 
 ### Production Checklist
 
