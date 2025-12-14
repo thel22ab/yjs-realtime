@@ -21,6 +21,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
     const editorRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
+    const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const [users, setUsers] = useState<string[]>([]);
 
     // Local state for CIA form fields
@@ -32,6 +33,20 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
 
     // Yjs refs for CIA updates
     const ydocRef = useRef<Y.Doc | null>(null);
+
+    // Listen for browser online/offline events (crucial for DevTools offline simulation)
+    useEffect(() => {
+        const handleOnline = () => setIsOnline(true);
+        const handleOffline = () => setIsOnline(false);
+
+        window.addEventListener('online', handleOnline);
+        window.addEventListener('offline', handleOffline);
+
+        return () => {
+            window.removeEventListener('online', handleOnline);
+            window.removeEventListener('offline', handleOffline);
+        };
+    }, []);
 
     useEffect(() => {
         if (!editorRef.current) return;
@@ -122,17 +137,20 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                 <div>
                     <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-1">Document Status</h2>
                     <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${connectionStatus === 'connected' ? 'bg-green-500' :
-                            connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
-                                'bg-amber-500'
+                        <span className={`w-2 h-2 rounded-full ${!isOnline ? 'bg-amber-500' :
+                                connectionStatus === 'connected' ? 'bg-green-500' :
+                                    connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
+                                        'bg-amber-500'
                             }`}></span>
-                        <span className={`font-medium text-sm ${connectionStatus === 'connected' ? 'text-green-700' :
-                            connectionStatus === 'connecting' ? 'text-yellow-700' :
-                                'text-amber-700'
+                        <span className={`font-medium text-sm ${!isOnline ? 'text-amber-700' :
+                                connectionStatus === 'connected' ? 'text-green-700' :
+                                    connectionStatus === 'connecting' ? 'text-yellow-700' :
+                                        'text-amber-700'
                             }`}>
-                            {connectionStatus === 'connected' ? 'Synchronized' :
-                                connectionStatus === 'connecting' ? 'Connecting...' :
-                                    'Offline Mode'}
+                            {!isOnline ? 'Offline Mode' :
+                                connectionStatus === 'connected' ? 'Synchronized' :
+                                    connectionStatus === 'connecting' ? 'Connecting...' :
+                                        'Offline Mode'}
                         </span>
                     </div>
                 </div>
