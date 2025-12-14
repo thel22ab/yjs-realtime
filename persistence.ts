@@ -14,7 +14,7 @@ const prisma = new PrismaClient({ adapter });
 
 // ---- Tuning Constants ----
 const DEBOUNCE_MS = 500;
-const COMPACTION_INTERVAL_MS = 60_000;
+const COMPACTION_INTERVAL_MS = 10_000; // 10 seconds for testing (normally 60_000)
 
 // ---- In-memory Document Metadata ----
 interface DocMeta {
@@ -84,6 +84,17 @@ export function startCompactionTimer(docId: string, doc: Y.Doc) {
     }, COMPACTION_INTERVAL_MS);
 }
 
+// Convert CIA string value to integer (0-3)
+function ciaStringToInt(value: unknown): number {
+    switch (value) {
+        case 'Low': return 1;
+        case 'Medium': return 2;
+        case 'High': return 3;
+        case 'Critical': return 3; // Map Critical to High (3)
+        default: return 0; // Not set
+    }
+}
+
 async function compactDoc(docId: string, doc: Y.Doc) {
     const meta = docMeta.get(docId);
 
@@ -96,9 +107,14 @@ async function compactDoc(docId: string, doc: Y.Doc) {
     const snapshotBuf = Buffer.from(snapshot);
     const now = BigInt(Date.now());
 
+    // Extract CIA values from the Yjs document
+    const ciaMap = doc.getMap('cia');
+    const confidentiality = ciaStringToInt(ciaMap.get('confidentiality'));
+    const integrity = ciaStringToInt(ciaMap.get('integrity'));
+    const availability = ciaStringToInt(ciaMap.get('availability'));
+
     try {
-        // Transaction: Save Snapshot + Delete Updates
-        // Prisma 7 allows easier transactions
+        // Transaction: Save Snapshot + Delete Updates + Update Document CIA
         await prisma.$transaction([
             prisma.documentSnapshot.upsert({
                 where: { documentId: docId },
@@ -115,12 +131,21 @@ async function compactDoc(docId: string, doc: Y.Doc) {
             prisma.documentUpdate.deleteMany({
                 where: { documentId: docId },
             }),
+            // Update the document's CIA values
+            prisma.document.update({
+                where: { id: docId },
+                data: {
+                    confidentiality,
+                    integrity,
+                    availability,
+                },
+            }),
         ]);
 
         if (meta) meta.updateRowsSinceCompact = 0;
 
         console.log(
-            `[Compaction] Snapshot saved for ${docId} (${snapshot.byteLength} bytes)`,
+            `[Compaction] Snapshot saved for ${docId} (${snapshot.byteLength} bytes), CIA: C=${confidentiality} I=${integrity} A=${availability}`,
         );
     } catch (error) {
         console.error(`[Compaction] Failed for ${docId}:`, error);

@@ -33,13 +33,12 @@ export async function getDocuments() {
                 createdAt: 'desc',
             },
         });
-        // Prisma returns Date objects for DateTime fields, but the previous implementation might have returned strings (SQLite default).
-        // Since this is a server action returning to Client Components (likely), we might need to serialize dates if they are passed directly.
-        // However, looking at the previous code: "return stmt.all() as { id: string; title: string; created_at: string }[];"
-        // It expected strings.
-        // Let's verify usage or map them.
         return docs.map(doc => ({
-            ...doc,
+            id: doc.id,
+            title: doc.title,
+            confidentiality: doc.confidentiality,
+            integrity: doc.integrity,
+            availability: doc.availability,
             created_at: doc.createdAt.toISOString(),
         }));
     } catch (error) {

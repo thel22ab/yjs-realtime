@@ -8,9 +8,12 @@ datasource db {
 }
 
 model Document {
-    id        String   @id
-    title     String
-    createdAt DateTime @default(now()) @map("created_at")
+    id              String   @id
+    title           String
+    confidentiality Int      @default(0)
+    integrity       Int      @default(0)
+    availability    Int      @default(0)
+    createdAt       DateTime @default(now()) @map("created_at")
 
     @@map("documents")
 }

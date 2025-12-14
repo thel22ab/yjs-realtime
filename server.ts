@@ -5,9 +5,9 @@ import { createServer } from "http";
 import { parse } from "url";
 import next from "next";
 import { WebSocketServer } from "ws";
-import { setupWSConnection } from "@y/websocket-server/utils";
+import { setupWSConnection, setPersistence } from "@y/websocket-server/utils";
 import * as persistence from "./persistence";
-import { Doc } from "yjs"; // Import Yjs types if needed
+import { Doc } from "yjs";
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
@@ -25,6 +25,36 @@ app.prepare().then(() => {
 
     // Create WebSocket server
     const wss = new WebSocketServer({ noServer: true });
+
+    // Set up the global persistence handler for @y/websocket-server
+    // This must be done before any WebSocket connections
+    setPersistence({
+        provider: null,
+        bindState: async (docName: string, doc: Doc) => {
+            // Load persisted state from SQLite
+            await persistence.loadDocFromDb(docName, doc);
+
+            // Start periodic compaction
+            persistence.startCompactionTimer(docName, doc);
+
+            // Attach update listener for persistence (once per doc)
+            if (!(doc as any).__persistenceAttached) {
+                (doc as any).__persistenceAttached = true;
+
+                doc.on("update", (update: Uint8Array, origin: any) => {
+                    if (origin === "persistence") return;
+
+                    const meta = persistence.getOrCreateMeta(docName);
+                    meta.pending.push(update);
+                    persistence.scheduleFlush(docName);
+                });
+            }
+        },
+        writeState: async (_docName: string, _doc: Doc) => {
+            // Called when the last connection closes
+            // We already persist on updates, so nothing extra needed
+        },
+    });
 
     // Handle WebSocket upgrades
     server.on("upgrade", (req, socket, head) => {
@@ -54,32 +84,8 @@ app.prepare().then(() => {
         const url = new URL(req.url!, `http://${hostname}:${port}`);
         const docId = decodeURIComponent(url.pathname.replace(/^\/yjs\//, ""));
 
-        setupWSConnection(ws, req, {
-            gc: true,
-
-            bindState: async (doc: Doc) => {
-                // Load persisted state from SQLite
-                await persistence.loadDocFromDb(docId, doc);
-
-                // Start periodic compaction
-                persistence.startCompactionTimer(docId, doc);
-
-                // Attach update listener for persistence (once per doc)
-                // We use a custom property to track if listener is attached.
-                // In TS, we can cast to any or extend the type.
-                if (!(doc as any).__persistenceAttached) {
-                    (doc as any).__persistenceAttached = true;
-
-                    doc.on("update", (update: Uint8Array, origin: any) => {
-                        if (origin === "persistence") return;
-
-                        const meta = persistence.getOrCreateMeta(docId);
-                        meta.pending.push(update);
-                        persistence.scheduleFlush(docId);
-                    });
-                }
-            },
-        });
+        // The library will use the global persistence we set above
+        setupWSConnection(ws, req, { docName: docId, gc: true });
     });
 
     // Graceful shutdown
@@ -95,3 +101,4 @@ app.prepare().then(() => {
         console.log(`> Yjs WS endpoint: ws://${hostname}:${port}/yjs/<docId>`);
     });
 });
+

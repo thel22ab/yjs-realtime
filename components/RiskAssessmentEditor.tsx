@@ -42,15 +42,16 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
         const yXmlFragment = ydoc.getXmlFragment('prosemirror');
 
         // Connect to WebSocket server
+        // The server expects connections at /yjs/<docId>, so we append /yjs to the base URL
         const provider = new WebsocketProvider(
-            process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000',
+            (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000') + '/yjs',
             documentId,
             ydoc,
             { connect: true }
         );
 
         // IndexedDB persistence for offline support
-        
+
         const indexeddbProvider = new IndexeddbPersistence(documentId, ydoc);
         indexeddbProvider.on('synced', () => {
             console.log('Local content loaded from IndexedDB');
