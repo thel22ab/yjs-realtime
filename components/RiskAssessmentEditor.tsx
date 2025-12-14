@@ -50,6 +50,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
         );
 
         // IndexedDB persistence for offline support
+        
         const indexeddbProvider = new IndexeddbPersistence(documentId, ydoc);
         indexeddbProvider.on('synced', () => {
             console.log('Local content loaded from IndexedDB');
