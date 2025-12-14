@@ -1,0 +1,34 @@
+generator client {
+    provider = "prisma-client"
+    output   = "./generated/prisma"
+}
+
+datasource db {
+    provider = "sqlite"
+}
+
+model Document {
+    id        String   @id
+    title     String
+    createdAt DateTime @default(now()) @map("created_at")
+
+    @@map("documents")
+}
+
+model DocumentSnapshot {
+    documentId String @id @map("document_id")
+    snapshot   Bytes  @map("snapshot_update")
+    updatedAt  BigInt @map("updated_at")
+
+    @@map("document_snapshots")
+}
+
+model DocumentUpdate {
+    id         Int    @id @default(autoincrement())
+    documentId String @map("document_id")
+    update     Bytes
+    createdAt  BigInt @map("created_at")
+
+    @@index([documentId, id])
+    @@map("document_updates")
+}

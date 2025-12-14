@@ -1,22 +1,20 @@
-import Database from 'better-sqlite3';
-import path from 'path';
+import { PrismaClient } from '../prisma/generated/prisma/client';
+import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
 
-const db = new Database('risk-assessments.db');
-db.pragma('journal_mode = WAL');
+const prismaClientSingleton = () => {
+  // Prisma 7 requires a driver adapter for all databases
+  const adapter = new PrismaBetterSqlite3({
+    url: process.env.DATABASE_URL || 'file:../risk-assessments.db',
+  });
+  return new PrismaClient({ adapter });
+};
 
-// Ensure tables exist
-db.exec(`
-  CREATE TABLE IF NOT EXISTS documents (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
+const globalForPrisma = globalThis as unknown as {
+  prisma: ReturnType<typeof prismaClientSingleton> | undefined;
+};
 
-  CREATE TABLE IF NOT EXISTS document_snapshots (
-    document_id TEXT PRIMARY KEY,
-    state_vector BLOB,
-    updated_at DATETIME
-  );
-`);
+const prisma = globalForPrisma.prisma ?? prismaClientSingleton();
 
-export default db;
+export default prisma;
+
+if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
