@@ -10,7 +10,7 @@ interface StoreShape {
     prosemirror: any;
 }
 
-export const store = syncedStore({
+export const createStore = () => syncedStore({
     cia: {},
     controls: {},
     prosemirror: "xml",

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { EditorState } from 'prosemirror-state';
 import { EditorView } from 'prosemirror-view';
 import { schema } from 'prosemirror-schema-basic';
@@ -10,7 +10,7 @@ import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
 import { useSyncedStore } from '@syncedstore/react';
-import { store, getYjsDoc } from '../lib/store';
+import { createStore, getYjsDoc } from '../lib/store';
 
 interface RiskAssessmentEditorProps {
     documentId: string;
@@ -26,8 +26,9 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const [users, setUsers] = useState<string[]>([]);
 
-    // SyncedStore state
-    const state = useSyncedStore(store);
+    // Local SyncedStore for this document
+    const docStore = useMemo(() => createStore(), [documentId]);
+    const state = useSyncedStore(docStore);
 
     // Listen for browser online/offline events (crucial for DevTools offline simulation)
     useEffect(() => {
@@ -46,9 +47,10 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
     useEffect(() => {
         if (!editorRef.current) return;
 
-        // Initialize Yjs document from the store
-        const ydoc = getYjsDoc(store);
-        const yXmlFragment = state.prosemirror;
+        // Initialize Yjs document from the local store
+        const ydoc = getYjsDoc(docStore);
+        // Get the raw Yjs XmlFragment directly (not through proxy) for y-prosemirror
+        const yXmlFragment = ydoc.getXmlFragment('prosemirror');
 
         // Connect to WebSocket server
         // The server expects connections at /yjs/<docId>, so we append /yjs / to the base URL
@@ -103,7 +105,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
             provider.destroy();
             view.destroy();
         };
-    }, [documentId, userName, state.prosemirror]);
+    }, [documentId, userName]);
 
     // Cybersecurity control catalog
     const CONTROL_CATALOG: Record<string, string> = {

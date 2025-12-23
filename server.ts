@@ -40,9 +40,9 @@ app.prepare().then(() => {
 
                 doc.on("update", (update: Uint8Array, origin: any) => {
                     if (origin === "persistence") return;
-                    
-                    console.log(`[Update] Captured update for ${docName}, size: ${update.byteLength}, origin: ${origin}`);
-                    
+
+                    console.log(`[Update] Captured for ${docName}, size: ${update.byteLength}`);
+
                     const meta = persistence.getOrCreateMeta(docName);
                     meta.pending.push(update);
                     persistence.scheduleFlush(docName);
@@ -57,9 +57,10 @@ app.prepare().then(() => {
             console.log(`[bindState] Starting compaction timer for: ${docName}`);
             persistence.startCompactionTimer(docName, doc);
         },
-        writeState: async (_docName: string, _doc: Doc) => {
-            // Called when the last connection closes
-            // We already persist on updates, so nothing extra needed
+        writeState: async (docName: string, _doc: Doc) => {
+            // Called when the last connection closes - stop timers to prevent memory leaks
+            console.log(`[writeState] Stopping timers for idle document: ${docName}`);
+            persistence.stopCompactionTimer(docName);
         },
     });
 

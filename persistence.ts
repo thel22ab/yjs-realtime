@@ -2,18 +2,10 @@
 // Handles SQLite persistence for Yjs documents using Prisma 7
 
 import * as Y from "yjs";
-import { PrismaClient } from "./prisma/generated/prisma/client";
-import { PrismaBetterSqlite3 } from "@prisma/adapter-better-sqlite3";
-
-// ---- Prisma Setup ----
-// Prisma 7 requires a driver adapter for all databases
-const adapter = new PrismaBetterSqlite3({
-    url: process.env.DATABASE_URL || "file:../risk-assessments.db",
-});
-const prisma = new PrismaClient({ adapter });
+import prisma from "./lib/db";
 
 // ---- Tuning Constants ----
-const DEBOUNCE_MS = 500;
+const DEBOUNCE_MS = 50;
 const COMPACTION_INTERVAL_MS = 10_000; // 10 seconds for testing (normally 60_000)
 
 // ---- In-memory Document Metadata ----
@@ -50,7 +42,6 @@ async function flushPendingUpdates(docId: string) {
 
     // Merge pending updates into a single blob
     const merged = Y.mergeUpdates(meta.pending);
-    meta.pending = [];
 
     try {
         await prisma.documentUpdate.create({
@@ -60,6 +51,8 @@ async function flushPendingUpdates(docId: string) {
                 createdAt: BigInt(Date.now()),
             },
         });
+        // Only clear pending after successful write to prevent data loss
+        meta.pending = [];
         meta.updateRowsSinceCompact += 1;
         console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
     } catch (error) {
@@ -89,6 +82,20 @@ export function startCompactionTimer(docId: string, doc: Y.Doc) {
     }, COMPACTION_INTERVAL_MS);
 }
 
+export function stopCompactionTimer(docId: string) {
+    const meta = docMeta.get(docId);
+    if (!meta) return;
+
+    if (meta.compactTimer) {
+        clearInterval(meta.compactTimer);
+        meta.compactTimer = null;
+    }
+    if (meta.flushTimer) {
+        clearTimeout(meta.flushTimer);
+        meta.flushTimer = null;
+    }
+}
+
 // Convert CIA string value to integer (0-3)
 function ciaStringToInt(value: unknown): number {
     switch (value) {
@@ -114,9 +121,10 @@ async function compactDoc(docId: string, doc: Y.Doc) {
 
     // Extract CIA values from the Yjs document
     const ciaMap = doc.getMap('cia');
-    const confidentiality = ciaStringToInt(ciaMap.get('confidentiality'));
-    const integrity = ciaStringToInt(ciaMap.get('integrity'));
-    const availability = ciaStringToInt(ciaMap.get('availability'));
+    const rawCia = ciaMap.toJSON();
+    const confidentiality = ciaStringToInt(rawCia.confidentiality);
+    const integrity = ciaStringToInt(rawCia.integrity);
+    const availability = ciaStringToInt(rawCia.availability);
 
     try {
         // Transaction: Save Snapshot + Delete Updates + Update Document CIA
@@ -149,11 +157,9 @@ async function compactDoc(docId: string, doc: Y.Doc) {
 
         if (meta) meta.updateRowsSinceCompact = 0;
 
-        console.log(
-            `[Compaction] Snapshot saved for ${docId} (${snapshot.byteLength} bytes), CIA: C=${confidentiality} I=${integrity} A=${availability}`,
-        );
+        console.log(`[Compaction] Success: ${docId} (C=${confidentiality} I=${integrity} A=${availability})`);
     } catch (error) {
-        console.error(`[Compaction] Failed for ${docId}:`, error);
+        console.error(`[Compaction] FAILED for ${docId}:`, error);
     }
 }
 

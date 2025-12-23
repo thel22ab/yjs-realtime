@@ -15,22 +15,27 @@ model Document {
     availability    Int      @default(0)
     createdAt       DateTime @default(now()) @map("created_at")
 
+    snapshot DocumentSnapshot?
+    updates  DocumentUpdate[]
+
     @@map("documents")
 }
 
 model DocumentSnapshot {
-    documentId String @id @map("document_id")
-    snapshot   Bytes  @map("snapshot_update")
-    updatedAt  BigInt @map("updated_at")
+    documentId String   @id @map("document_id")
+    document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+    snapshot   Bytes    @map("snapshot_update")
+    updatedAt  BigInt   @map("updated_at")
 
     @@map("document_snapshots")
 }
 
 model DocumentUpdate {
-    id         Int    @id @default(autoincrement())
-    documentId String @map("document_id")
+    id         Int      @id @default(autoincrement())
+    documentId String   @map("document_id")
+    document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
     update     Bytes
-    createdAt  BigInt @map("created_at")
+    createdAt  BigInt   @map("created_at")
 
     @@index([documentId, id])
     @@map("document_updates")

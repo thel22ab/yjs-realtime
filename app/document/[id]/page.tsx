@@ -36,7 +36,7 @@ export default async function DocumentPage({ params }: PageProps) {
             </header>
 
             <main className="flex-1 p-8 max-w-5xl mx-auto w-full">
-                <RiskAssessmentEditor documentId={id} userName={userName} />
+                <RiskAssessmentEditor key={id} documentId={id} userName={userName} />
             </main>
         </div>
     );
