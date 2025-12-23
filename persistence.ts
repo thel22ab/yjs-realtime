@@ -163,6 +163,30 @@ async function compactDoc(docId: string, doc: Y.Doc) {
     }
 }
 
+// Public function to save and compact a document (called when document is closed)
+export async function saveAndCompact(docId: string, doc: Y.Doc) {
+    console.log(`[SaveAndCompact] Saving document on close: ${docId}`);
+
+    // Flush any pending updates first
+    await flushPendingUpdates(docId);
+
+    // Force compaction regardless of updateRowsSinceCompact
+    const meta = docMeta.get(docId);
+    if (meta) {
+        // Temporarily set to 1 to force compaction if needed
+        const hadUpdates = meta.updateRowsSinceCompact;
+        meta.updateRowsSinceCompact = 1;
+        await compactDoc(docId, doc);
+        if (hadUpdates === 0) {
+            // Still log that we saved even if no new updates
+            console.log(`[SaveAndCompact] Document ${docId} saved (no pending updates)`);
+        }
+    } else {
+        // No meta means fresh document, still try to compact
+        await compactDoc(docId, doc);
+    }
+}
+
 export async function loadDocFromDb(docId: string, doc: Y.Doc) {
     const ORIGIN = "persistence";
 

@@ -57,9 +57,10 @@ app.prepare().then(() => {
             console.log(`[bindState] Starting compaction timer for: ${docName}`);
             persistence.startCompactionTimer(docName, doc);
         },
-        writeState: async (docName: string, _doc: Doc) => {
-            // Called when the last connection closes - stop timers to prevent memory leaks
-            console.log(`[writeState] Stopping timers for idle document: ${docName}`);
+        writeState: async (docName: string, doc: Doc) => {
+            // Called when the last connection closes - save and compact the document
+            console.log(`[writeState] Saving and compacting document on close: ${docName}`);
+            await persistence.saveAndCompact(docName, doc);
             persistence.stopCompactionTimer(docName);
         },
     });

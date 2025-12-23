@@ -64,3 +64,16 @@ export async function getDocument(id: string) {
         return undefined;
     }
 }
+
+export async function deleteDocument(id: string) {
+    try {
+        // Cascade delete will remove associated snapshots and updates
+        await db.document.delete({
+            where: { id },
+        });
+        return { success: true };
+    } catch (error) {
+        console.error('Failed to delete document:', error);
+        return { success: false, error: 'Failed to delete document' };
+    }
+}
