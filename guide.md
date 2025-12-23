@@ -10,10 +10,11 @@
 2. [Implementation Steps](#2-implementation-steps)
 3. [State Management Deep Dive](#3-state-management-deep-dive)
 4. [Data Flow & Synchronization](#4-data-flow--synchronization)
-5. [Sidecar Architecture Patterns](#5-sidecar-architecture-patterns)
-6. [Challenges & Solutions](#6-challenges--solutions-the-gotchas)
-7. [Final Recommendations](#7-final-recommendations-for-students)
-8. [Offline Editing](#8-offline-editing)
+5. [Persistence Architecture](#5-persistence-architecture)
+6. [Sidecar Architecture Patterns](#6-sidecar-architecture-patterns)
+7. [Challenges & Solutions](#7-challenges--solutions-the-gotchas)
+8. [Final Recommendations](#8-final-recommendations-for-students)
+9. [Offline Editing](#9-offline-editing)
 
 ---
 
@@ -280,6 +281,73 @@ awareness.on('change', () => {
 
 This is separate from document state — awareness is ephemeral and not persisted.
 
+### Simplifying State with SyncedStore
+
+Managing raw Yjs observers and React state synchronization can get verbose. We simplified this using **SyncedStore** — a library that wraps Yjs with a reactive proxy API:
+
+```bash
+npm install @syncedstore/core @syncedstore/react
+```
+
+**Defining the Store Shape**
+
+```typescript
+// lib/store.ts
+import { syncedStore, getYjsDoc } from "@syncedstore/core";
+
+interface StoreShape {
+    cia: {
+        confidentiality?: string;
+        integrity?: string;
+        availability?: string;
+    };
+    controls: Record<string, boolean>;
+    prosemirror: any; // Special "xml" type for ProseMirror
+}
+
+export const createStore = () => syncedStore({
+    cia: {},
+    controls: {},
+    prosemirror: "xml",
+}) as StoreShape;
+
+export { getYjsDoc };
+```
+
+**Using SyncedStore in React**
+
+```typescript
+import { useSyncedStore } from '@syncedstore/react';
+import { createStore, getYjsDoc } from '../lib/store';
+
+function RiskAssessmentEditor({ documentId }: Props) {
+    // Create a store per document
+    const docStore = useMemo(() => createStore(), [documentId]);
+    const state = useSyncedStore(docStore);
+
+    // State updates are now reactive — no manual observers!
+    const handleCiaChange = (field: keyof typeof state.cia, value: string) => {
+        state.cia[field] = value;  // Triggers re-render automatically
+    };
+
+    return (
+        <select
+            value={state.cia.confidentiality || 'Low'}
+            onChange={(e) => handleCiaChange('confidentiality', e.target.value)}
+        >
+            {/* options */}
+        </select>
+    );
+}
+```
+
+| Approach | Boilerplate | React Integration | Learning Curve |
+|----------|-------------|-------------------|----------------|
+| Raw Yjs + observers | High | Manual `useState` sync | Steeper |
+| SyncedStore | Low | Automatic via proxy | Gentler |
+
+> **When to use raw Yjs**: If you need fine-grained control over transactions or custom CRDT types. Otherwise, SyncedStore significantly reduces boilerplate.
+
 ---
 
 ## 4. Data Flow & Synchronization
@@ -317,7 +385,178 @@ Yjs uses **CRDTs (Conflict-free Replicated Data Types)** to handle concurrent ed
 
 ---
 
-## 5. Sidecar Architecture Patterns
+## 5. Persistence Architecture
+
+Our persistence strategy goes beyond simple "save on every keystroke." We implemented a **three-tier system** for durability and efficiency:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      SERVER PERSISTENCE FLOW                             │
+│                                                                          │
+│  Yjs Update Event                                                        │
+│        │                                                                 │
+│        ▼                                                                 │
+│  ┌──────────────┐    50ms debounce    ┌──────────────────────────────┐  │
+│  │ meta.pending │ ─────────────────►  │ flushPendingUpdates()        │  │
+│  │   (buffer)   │                     │ → Merge updates              │  │
+│  └──────────────┘                     │ → INSERT into document_updates│  │
+│                                       └──────────────────────────────┘  │
+│                                                   │                      │
+│                                                   ▼                      │
+│                               ┌──────────────────────────────────────┐  │
+│    Every 10 seconds ────────► │ compactDoc()                         │  │
+│                               │ → Encode full Y.Doc snapshot         │  │
+│                               │ → UPSERT into document_snapshots     │  │
+│                               │ → DELETE old document_updates        │  │
+│                               │ → UPDATE Document CIA values         │  │
+│                               └──────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Approach?
+
+| Strategy | Pros | Cons |
+|----------|------|------|
+| Save every keystroke | Simple, zero data loss | High DB load, slow |
+| Save on disconnect only | Minimal DB load | Data loss if server crashes |
+| **Debounce + Compaction** | Balanced load, minimal loss | More complex |
+
+### Implementation: Debounced Flushing
+
+Updates are batched into a `pending` array and flushed after 50ms of inactivity:
+
+```typescript
+// persistence.ts
+export function scheduleFlush(docId: string) {
+    const meta = getOrCreateMeta(docId);
+    
+    if (meta.flushTimer) clearTimeout(meta.flushTimer);
+    meta.flushTimer = setTimeout(() => {
+        meta.flushTimer = null;
+        void flushPendingUpdates(docId);
+    }, 50);  // 50ms debounce
+}
+
+async function flushPendingUpdates(docId: string) {
+    const meta = docMeta.get(docId);
+    if (!meta || meta.pending.length === 0) return;
+
+    const merged = Y.mergeUpdates(meta.pending);
+    
+    try {
+        await prisma.documentUpdate.create({
+            data: {
+                documentId: docId,
+                update: Buffer.from(merged),
+                createdAt: BigInt(Date.now()),
+            },
+        });
+        // Only clear after successful write to prevent data loss
+        meta.pending = [];
+    } catch (error) {
+        console.error(`Failed to flush:`, error);
+        // Keep pending — will retry on next flush
+    }
+}
+```
+
+### Implementation: Periodic Compaction
+
+Every 10 seconds, we compact all pending updates into a single snapshot:
+
+```typescript
+export function startCompactionTimer(docId: string, doc: Y.Doc) {
+    const meta = getOrCreateMeta(docId);
+    if (meta.compactTimer) return;
+
+    meta.compactTimer = setInterval(() => {
+        void compactDoc(docId, doc);
+    }, 10_000);  // 10 seconds
+}
+
+async function compactDoc(docId: string, doc: Y.Doc) {
+    await flushPendingUpdates(docId);  // Flush first
+    
+    const snapshot = Y.encodeStateAsUpdate(doc);
+    
+    // Extract CIA values for the sidecar Document table
+    const ciaMap = doc.getMap('cia');
+    const cia = ciaMap.toJSON();
+    
+    await prisma.$transaction([
+        prisma.documentSnapshot.upsert({
+            where: { documentId: docId },
+            update: { snapshot: Buffer.from(snapshot), updatedAt: BigInt(Date.now()) },
+            create: { documentId: docId, snapshot: Buffer.from(snapshot), updatedAt: BigInt(Date.now()) },
+        }),
+        prisma.documentUpdate.deleteMany({ where: { documentId: docId } }),
+        prisma.document.update({
+            where: { id: docId },
+            data: {
+                confidentiality: ciaToInt(cia.confidentiality),
+                integrity: ciaToInt(cia.integrity),
+                availability: ciaToInt(cia.availability),
+            },
+        }),
+    ]);
+}
+```
+
+### Cleanup on Disconnect
+
+To prevent memory leaks, we stop timers when all clients disconnect:
+
+```typescript
+// server.ts
+setPersistence({
+    bindState: async (docName, doc) => {
+        await persistence.loadDocFromDb(docName, doc);
+        persistence.startCompactionTimer(docName, doc);
+    },
+    writeState: async (docName, _doc) => {
+        // Called when last client disconnects
+        persistence.stopCompactionTimer(docName);
+    },
+});
+```
+
+### Database Schema (Prisma)
+
+```prisma
+model Document {
+    id              String   @id
+    title           String
+    confidentiality Int      @default(0)
+    integrity       Int      @default(0)
+    availability    Int      @default(0)
+    
+    snapshot DocumentSnapshot?
+    updates  DocumentUpdate[]
+}
+
+model DocumentSnapshot {
+    documentId String   @id
+    document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+    snapshot   Bytes
+    updatedAt  BigInt
+}
+
+model DocumentUpdate {
+    id         Int      @id @default(autoincrement())
+    documentId String
+    document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+    update     Bytes
+    createdAt  BigInt
+    
+    @@index([documentId, id])
+}
+```
+
+> **Note**: The `onDelete: Cascade` ensures that when a Document is deleted, its snapshots and updates are automatically cleaned up.
+
+---
+
+## 6. Sidecar Architecture Patterns
 
 As your collaborative application grows, you'll need to think about **scaling** and **deployment patterns**. The "sidecar architecture" is a common approach where a specialized, independent service handles real-time synchronization separately from your main application.
 
@@ -462,7 +701,7 @@ Consider extracting to a separate sidecar when:
 
 ---
 
-## 6. Challenges & Solutions (The "Gotchas")
+## 7. Challenges & Solutions (The "Gotchas")
 
 ### Issue 1: The `ws` Module
 
@@ -547,7 +786,54 @@ server.on('upgrade', (request, socket, head) => {
 
 ---
 
-## 7. Final Recommendations for Students
+### Issue 5: Document Isolation with React Navigation
+
+**Problem**: When navigating between documents (e.g., `/document/abc` → `/document/xyz`), edits made in one document would sometimes appear in another document.
+
+**Cause**: React reuses component instances when navigating between routes with the same component. The Yjs document and WebSocket provider from the previous route would persist and potentially receive updates meant for the new document.
+
+**Solution**: Add a `key` prop to force React to destroy and recreate the component when the document ID changes:
+
+```tsx
+// ❌ BAD: React may reuse the component instance
+<RiskAssessmentEditor documentId={id} userName={userName} />
+
+// ✅ GOOD: Forces full remount on ID change
+<RiskAssessmentEditor key={id} documentId={id} userName={userName} />
+```
+
+**Why this works**: The `key` prop tells React that this is a fundamentally different component instance. When the key changes, React will:
+1. Unmount the old component (running cleanup effects)
+2. Mount a fresh component (creating new Yjs doc, providers, etc.)
+
+This is the recommended React pattern for components that manage external subscriptions or stateful resources tied to a prop.
+
+---
+
+### Issue 6: SyncedStore Proxy with y-prosemirror
+
+**Problem**: When using SyncedStore, passing `state.prosemirror` directly to `ySyncPlugin()` caused issues because SyncedStore returns a **reactive proxy** rather than the raw Yjs type.
+
+**Symptom**: ProseMirror might not detect changes correctly, or you may see type errors.
+
+**Solution**: Get the raw `Y.XmlFragment` directly from the underlying Yjs document:
+
+```typescript
+// ❌ BAD: Passing the proxy
+const yXmlFragment = state.prosemirror;
+ySyncPlugin(yXmlFragment);  // May not work correctly
+
+// ✅ GOOD: Get raw Yjs type directly
+const ydoc = getYjsDoc(docStore);
+const yXmlFragment = ydoc.getXmlFragment('prosemirror');
+ySyncPlugin(yXmlFragment);  // Works correctly
+```
+
+**Rule of thumb**: Use SyncedStore's reactive state for React rendering (`state.cia.confidentiality`), but use raw Yjs types for library integrations (`ydoc.getXmlFragment()`).
+
+---
+
+## 8. Final Recommendations for Students
 
 ### Getting Started
 
@@ -591,7 +877,7 @@ When following tutorials, pay close attention to library versions. The JS ecosys
 
 ---
 
-## 8. Offline Editing
+## 9. Offline Editing
 
 To enable offline support, we use `y-indexeddb` to cache the Yjs document in the browser's IndexedDB. This provides a seamless experience where:
 

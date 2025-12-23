@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "NODE_ENV=production tsx server.ts",
     "postinstall": "prisma generate",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "jest"
   },
   "dependencies": {
     "@base-ui/react": "^1.0.0",
@@ -43,14 +44,20 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/jest": "^30.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/ws": "^8.18.1",
     "eslint": "^9",
     "eslint-config-next": "16.0.10",
+    "jest": "^30.2.0",
+    "jest-environment-jsdom": "^30.2.0",
+    "jest-mock-extended": "^4.0.0",
     "prisma": "^7.1.0",
     "tailwindcss": "^4",
+    "ts-jest": "^29.4.6",
+    "ts-node": "^10.9.2",
     "tsx": "^4.19.0",
     "typescript": "^5"
   }

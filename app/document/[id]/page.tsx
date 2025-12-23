@@ -1,7 +1,7 @@
 import { getDocument } from '@/app/actions/documents';
 import RiskAssessmentEditor from '@/components/RiskAssessmentEditor';
+import { SaveAndRedirectLink } from '@/components/SaveAndRedirectLink';
 import { notFound } from 'next/navigation';
-import Link from 'next/link';
 
 interface PageProps {
     params: Promise<{ id: string }>;
@@ -23,9 +23,9 @@ export default async function DocumentPage({ params }: PageProps) {
         <div className="min-h-screen bg-gray-50 flex flex-col">
             <header className="bg-white border-b border-gray-200 px-8 py-4 flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                    <Link href="/" className="text-gray-500 hover:text-gray-800 transition">
+                    <SaveAndRedirectLink href="/" documentId={id} className="text-gray-500 hover:text-gray-800 transition">
                         ← Back to Dashboard
-                    </Link>
+                    </SaveAndRedirectLink>
                     <h1 className="text-xl font-bold text-gray-900 border-l border-gray-200 pl-4">
                         {doc.title}
                     </h1>

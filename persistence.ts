@@ -34,9 +34,15 @@ export function getOrCreateMeta(docId: string): DocMeta {
 
 // ---- Persistence Functions ----
 
-async function flushPendingUpdates(docId: string) {
+async function flushPendingUpdates(docId: string, doc?: Y.Doc) {
     const meta = docMeta.get(docId);
-    if (!meta || meta.pending.length === 0) return;
+    if (!meta || meta.pending.length === 0) {
+        // Even if no pending binary updates, if we have the doc, we might want to sync CIA values
+        if (doc) {
+            await updateDocumentCia(docId, doc);
+        }
+        return;
+    }
 
     console.log(`[Flush] Flushing ${meta.pending.length} updates for ${docId}`);
 
@@ -55,13 +61,40 @@ async function flushPendingUpdates(docId: string) {
         meta.pending = [];
         meta.updateRowsSinceCompact += 1;
         console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
+
+        // Also update CIA values in the sidecar document table
+        if (doc) {
+            await updateDocumentCia(docId, doc);
+        }
     } catch (error) {
         console.error(`[Persistence] Failed to flush updates for ${docId}:`, error);
-        // Pivot: put them back? or just log error? For now, log.
     }
 }
 
-export function scheduleFlush(docId: string) {
+// Helper to update CIA values specifically
+async function updateDocumentCia(docId: string, doc: Y.Doc) {
+    const ciaMap = doc.getMap('cia');
+    const rawCia = ciaMap.toJSON();
+    const confidentiality = ciaStringToInt(rawCia.confidentiality);
+    const integrity = ciaStringToInt(rawCia.integrity);
+    const availability = ciaStringToInt(rawCia.availability);
+
+    try {
+        await prisma.document.update({
+            where: { id: docId },
+            data: {
+                confidentiality,
+                integrity,
+                availability,
+            },
+        });
+        console.log(`[CIA Sync] Updated ${docId}: C=${confidentiality} I=${integrity} A=${availability}`);
+    } catch (error) {
+        console.error(`[CIA Sync] FAILED for ${docId}:`, error);
+    }
+}
+
+export function scheduleFlush(docId: string, doc: Y.Doc) {
     const meta = getOrCreateMeta(docId);
 
     console.log(`[Schedule] Scheduling flush for ${docId}, pending: ${meta.pending.length}`);
@@ -69,7 +102,7 @@ export function scheduleFlush(docId: string) {
     if (meta.flushTimer) clearTimeout(meta.flushTimer);
     meta.flushTimer = setTimeout(() => {
         meta.flushTimer = null;
-        void flushPendingUpdates(docId);
+        void flushPendingUpdates(docId, doc);
     }, DEBOUNCE_MS);
 }
 
@@ -94,6 +127,9 @@ export function stopCompactionTimer(docId: string) {
         clearTimeout(meta.flushTimer);
         meta.flushTimer = null;
     }
+
+    // clean up meta
+    docMeta.delete(docId);
 }
 
 // Convert CIA string value to integer (0-3)
@@ -111,7 +147,7 @@ async function compactDoc(docId: string, doc: Y.Doc) {
     const meta = docMeta.get(docId);
 
     // Ensure everything pending is written first (optional, but good practice)
-    await flushPendingUpdates(docId);
+    await flushPendingUpdates(docId, doc);
 
     if (meta && meta.updateRowsSinceCompact === 0) return;
 
@@ -119,15 +155,9 @@ async function compactDoc(docId: string, doc: Y.Doc) {
     const snapshotBuf = Buffer.from(snapshot);
     const now = BigInt(Date.now());
 
-    // Extract CIA values from the Yjs document
-    const ciaMap = doc.getMap('cia');
-    const rawCia = ciaMap.toJSON();
-    const confidentiality = ciaStringToInt(rawCia.confidentiality);
-    const integrity = ciaStringToInt(rawCia.integrity);
-    const availability = ciaStringToInt(rawCia.availability);
-
     try {
-        // Transaction: Save Snapshot + Delete Updates + Update Document CIA
+        console.log(`[Compaction] Executing transaction for ${docId}`);
+        // Transaction: Save Snapshot + Delete Updates
         await prisma.$transaction([
             prisma.documentSnapshot.upsert({
                 where: { documentId: docId },
@@ -144,20 +174,14 @@ async function compactDoc(docId: string, doc: Y.Doc) {
             prisma.documentUpdate.deleteMany({
                 where: { documentId: docId },
             }),
-            // Update the document's CIA values
-            prisma.document.update({
-                where: { id: docId },
-                data: {
-                    confidentiality,
-                    integrity,
-                    availability,
-                },
-            }),
         ]);
+
+        // Also update CIA values to be sure they are in sync
+        await updateDocumentCia(docId, doc);
 
         if (meta) meta.updateRowsSinceCompact = 0;
 
-        console.log(`[Compaction] Success: ${docId} (C=${confidentiality} I=${integrity} A=${availability})`);
+        console.log(`[Compaction] Success: ${docId}`);
     } catch (error) {
         console.error(`[Compaction] FAILED for ${docId}:`, error);
     }
@@ -167,8 +191,8 @@ async function compactDoc(docId: string, doc: Y.Doc) {
 export async function saveAndCompact(docId: string, doc: Y.Doc) {
     console.log(`[SaveAndCompact] Saving document on close: ${docId}`);
 
-    // Flush any pending updates first
-    await flushPendingUpdates(docId);
+    // Flush any pending updates and update CIA values
+    await flushPendingUpdates(docId, doc);
 
     // Force compaction regardless of updateRowsSinceCompact
     const meta = docMeta.get(docId);
@@ -185,6 +209,13 @@ export async function saveAndCompact(docId: string, doc: Y.Doc) {
         // No meta means fresh document, still try to compact
         await compactDoc(docId, doc);
     }
+}
+
+// Force an immediate flush and sync for a doc if it exists in memory
+export async function forceFlush(docId: string, doc: Y.Doc) {
+    console.log(`[ForceFlush] Force saving document: ${docId}`);
+    await flushPendingUpdates(docId, doc);
+    await compactDoc(docId, doc);
 }
 
 export async function loadDocFromDb(docId: string, doc: Y.Doc) {

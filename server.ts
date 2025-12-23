@@ -5,9 +5,12 @@ import { createServer } from "http";
 import { parse } from "url";
 import next from "next";
 import { WebSocketServer } from "ws";
-import { setupWSConnection, setPersistence } from "@y/websocket-server/utils";
+import { setupWSConnection, setPersistence, docs } from "@y/websocket-server/utils";
 import * as persistence from "./persistence";
 import { Doc } from "yjs";
+
+// Export docs for API access
+export { docs };
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
@@ -45,7 +48,7 @@ app.prepare().then(() => {
 
                     const meta = persistence.getOrCreateMeta(docName);
                     meta.pending.push(update);
-                    persistence.scheduleFlush(docName);
+                    persistence.scheduleFlush(docName, doc);
                 });
             }
 
@@ -59,7 +62,7 @@ app.prepare().then(() => {
         },
         writeState: async (docName: string, doc: Doc) => {
             // Called when the last connection closes - save and compact the document
-            console.log(`[writeState] Saving and compacting document on close: ${docName}`);
+            console.log(`[writeState] LAST CONNECTION CLOSED. Saving and compacting document: ${docName}`);
             await persistence.saveAndCompact(docName, doc);
             persistence.stopCompactionTimer(docName);
         },
@@ -92,6 +95,12 @@ app.prepare().then(() => {
         // Extract document ID from URL
         const url = new URL(req.url!, `http://${hostname}:${port}`);
         const docId = decodeURIComponent(url.pathname.replace(/^\/yjs\//, ""));
+
+        console.log(`[WS] Connection established for doc: ${docId}`);
+
+        ws.on('close', () => {
+            console.log(`[WS] Connection closed for doc: ${docId}`);
+        });
 
         // The library will use the global persistence we set above
         setupWSConnection(ws, req, { docName: docId, gc: true });
