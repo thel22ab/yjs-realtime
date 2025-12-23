@@ -31,24 +31,31 @@ app.prepare().then(() => {
     setPersistence({
         provider: null,
         bindState: async (docName: string, doc: Doc) => {
-            // Load persisted state from SQLite
-            await persistence.loadDocFromDb(docName, doc);
+            console.log(`[bindState] Setting up document: ${docName}`);
 
-            // Start periodic compaction
-            persistence.startCompactionTimer(docName, doc);
-
-            // Attach update listener for persistence (once per doc)
+            // Attach update listener FIRST (before loading persisted data)
             if (!(doc as any).__persistenceAttached) {
+                console.log(`[bindState] Attaching update listener for: ${docName}`);
                 (doc as any).__persistenceAttached = true;
 
                 doc.on("update", (update: Uint8Array, origin: any) => {
                     if (origin === "persistence") return;
-
+                    
+                    console.log(`[Update] Captured update for ${docName}, size: ${update.byteLength}, origin: ${origin}`);
+                    
                     const meta = persistence.getOrCreateMeta(docName);
                     meta.pending.push(update);
                     persistence.scheduleFlush(docName);
                 });
             }
+
+            // Load persisted state from SQLite
+            console.log(`[bindState] Loading persisted state for: ${docName}`);
+            await persistence.loadDocFromDb(docName, doc);
+
+            // Start periodic compaction
+            console.log(`[bindState] Starting compaction timer for: ${docName}`);
+            persistence.startCompactionTimer(docName, doc);
         },
         writeState: async (_docName: string, _doc: Doc) => {
             // Called when the last connection closes

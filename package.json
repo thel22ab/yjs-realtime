@@ -13,6 +13,8 @@
     "@base-ui/react": "^1.0.0",
     "@prisma/adapter-better-sqlite3": "^7.1.0",
     "@prisma/client": "^7.1.0",
+    "@syncedstore/core": "^0.6.0",
+    "@syncedstore/react": "^0.6.0",
     "@y/websocket-server": "^0.1.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

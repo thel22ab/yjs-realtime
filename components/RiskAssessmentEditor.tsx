@@ -9,6 +9,8 @@ import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
+import { useSyncedStore } from '@syncedstore/react';
+import { store, getYjsDoc } from '../lib/store';
 
 interface RiskAssessmentEditorProps {
     documentId: string;
@@ -24,15 +26,8 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const [users, setUsers] = useState<string[]>([]);
 
-    // Local state for CIA form fields
-    const [cia, setCia] = useState({
-        confidentiality: 'Low',
-        integrity: 'Low',
-        availability: 'Low',
-    });
-
-    // Yjs refs for CIA updates
-    const ydocRef = useRef<Y.Doc | null>(null);
+    // SyncedStore state
+    const state = useSyncedStore(store);
 
     // Listen for browser online/offline events (crucial for DevTools offline simulation)
     useEffect(() => {
@@ -51,13 +46,12 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
     useEffect(() => {
         if (!editorRef.current) return;
 
-        // Initialize Yjs document and shared types
-        const ydoc = new Y.Doc();
-        ydocRef.current = ydoc;
-        const yXmlFragment = ydoc.getXmlFragment('prosemirror');
+        // Initialize Yjs document from the store
+        const ydoc = getYjsDoc(store);
+        const yXmlFragment = state.prosemirror;
 
         // Connect to WebSocket server
-        // The server expects connections at /yjs/<docId>, so we append /yjs to the base URL
+        // The server expects connections at /yjs/<docId>, so we append /yjs / to the base URL
         const provider = new WebsocketProvider(
             (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000') + '/yjs',
             documentId,
@@ -87,20 +81,8 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
             setUsers(activeUsers);
         });
 
-        // CIA Map binding (Key-Value Store)
-        const ciaMap = ydoc.getMap('cia');
-        const updateLocalCia = () => {
-            setCia({
-                confidentiality: (ciaMap.get('confidentiality') as string) || 'Low',
-                integrity: (ciaMap.get('integrity') as string) || 'Low',
-                availability: (ciaMap.get('availability') as string) || 'Low',
-            });
-        };
-        // Using observer pattern to update local state when remote changes arrive 'Observe all events that are created on this type.
-        ciaMap.observe(updateLocalCia);
-
         // Create ProseMirror editor state
-        const state = EditorState.create({
+        const editorState = EditorState.create({
             schema,
             plugins: [
                 ySyncPlugin(yXmlFragment),
@@ -111,7 +93,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
         });
 
         // Initialize editor view
-        const view = new EditorView(editorRef.current, { state });
+        const view = new EditorView(editorRef.current, { state: editorState });
 
         viewRef.current = view;
 
@@ -121,13 +103,70 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
             provider.destroy();
             view.destroy();
         };
-    }, [documentId, userName]);
+    }, [documentId, userName, state.prosemirror]);
+
+    // Cybersecurity control catalog
+    const CONTROL_CATALOG: Record<string, string> = {
+        encryption_at_rest: 'Data Encryption at Rest',
+        mfa_enforced: 'Multi-Factor Authentication',
+        access_logging: 'Access Logging & Review',
+        disaster_recovery: 'Disaster Recovery Plan',
+        vulnerability_scan: 'Regular Vulnerability Scanning',
+        incident_response: 'Incident Response Protocol',
+    };
+
+    // Helper to map CIA levels to numbers
+    const ciaToWeight = (level: string = 'Low'): number => {
+        const weights: Record<string, number> = {
+            Low: 1,
+            Medium: 3,
+            High: 5,
+            Critical: 7,
+        };
+        return weights[level] || 1;
+    };
+
+    // Effect to dynamically add/remove controls based on CIA scores
+    useEffect(() => {
+        const cScore = ciaToWeight(state.cia.confidentiality);
+        const iScore = ciaToWeight(state.cia.integrity);
+        const aScore = ciaToWeight(state.cia.availability);
+        const totalScore = cScore + iScore + aScore;
+
+        const requiredControls = new Set<string>();
+
+        // Rule 1: C > 4 (High or Critical)
+        if (cScore > 4) {
+            ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(c => requiredControls.add(c));
+        }
+
+        // Rule 2: Total > 12
+        if (totalScore > 12) {
+            Object.keys(CONTROL_CATALOG).forEach(c => requiredControls.add(c));
+        }
+
+        // Add missing controls
+        requiredControls.forEach(controlId => {
+            if (state.controls[controlId] === undefined) {
+                state.controls[controlId] = false;
+            }
+        });
+
+        // Remove controls no longer required
+        Object.keys(state.controls).forEach(controlId => {
+            if (!requiredControls.has(controlId)) {
+                delete state.controls[controlId];
+            }
+        });
+    }, [state.cia.confidentiality, state.cia.integrity, state.cia.availability]);
 
     // Handler for CIA changes
-    const handleCiaChange = (field: keyof typeof cia, value: string) => {
-        if (!ydocRef.current) return;
-        const ciaMap = ydocRef.current.getMap('cia');
-        ciaMap.set(field, value);
+    const handleCiaChange = (field: keyof typeof state.cia, value: string) => {
+        state.cia[field] = value;
+    };
+
+    const toggleControl = (controlId: string) => {
+        state.controls[controlId] = !state.controls[controlId];
     };
 
     return (
@@ -138,14 +177,14 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                     <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-1">Document Status</h2>
                     <div className="flex items-center gap-2">
                         <span className={`w-2 h-2 rounded-full ${!isOnline ? 'bg-amber-500' :
-                                connectionStatus === 'connected' ? 'bg-green-500' :
-                                    connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
-                                        'bg-amber-500'
+                            connectionStatus === 'connected' ? 'bg-green-500' :
+                                connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
+                                    'bg-amber-500'
                             }`}></span>
                         <span className={`font-medium text-sm ${!isOnline ? 'text-amber-700' :
-                                connectionStatus === 'connected' ? 'text-green-700' :
-                                    connectionStatus === 'connecting' ? 'text-yellow-700' :
-                                        'text-amber-700'
+                            connectionStatus === 'connected' ? 'text-green-700' :
+                                connectionStatus === 'connecting' ? 'text-yellow-700' :
+                                    'text-amber-700'
                             }`}>
                             {!isOnline ? 'Offline Mode' :
                                 connectionStatus === 'connected' ? 'Synchronized' :
@@ -170,7 +209,7 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                     <div key={metric} className="p-4 bg-gray-50 rounded-lg">
                         <label className="block text-xs font-bold text-gray-500 uppercase mb-2">{metric}</label>
                         <select
-                            value={cia[metric]}
+                            value={state.cia[metric] || 'Low'}
                             onChange={(e) => handleCiaChange(metric, e.target.value)}
                             className="w-full bg-white border border-gray-200 text-gray-800 text-sm rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none transition"
                         >
@@ -182,6 +221,29 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                     </div>
                 ))}
             </div>
+
+            {/* Dynamic Controls */}
+            {Object.keys(state.controls).length > 0 && (
+                <div className="mb-8 p-6 bg-blue-50 rounded-lg border border-blue-100">
+                    <h3 className="text-sm font-bold text-blue-800 uppercase tracking-wider mb-4">Required Security Controls</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {Object.keys(state.controls).map((controlId) => (
+                            <div key={controlId} className="flex items-center gap-3 bg-white p-3 rounded border border-blue-200 shadow-sm">
+                                <input
+                                    type="checkbox"
+                                    id={controlId}
+                                    checked={state.controls[controlId]}
+                                    onChange={() => toggleControl(controlId)}
+                                    className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                                />
+                                <label htmlFor={controlId} className="text-sm font-medium text-gray-700 cursor-pointer">
+                                    {CONTROL_CATALOG[controlId]}
+                                </label>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
 
             {/* ProseMirror Editor */}
             <div>

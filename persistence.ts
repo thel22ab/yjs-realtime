@@ -46,6 +46,8 @@ async function flushPendingUpdates(docId: string) {
     const meta = docMeta.get(docId);
     if (!meta || meta.pending.length === 0) return;
 
+    console.log(`[Flush] Flushing ${meta.pending.length} updates for ${docId}`);
+
     // Merge pending updates into a single blob
     const merged = Y.mergeUpdates(meta.pending);
     meta.pending = [];
@@ -59,6 +61,7 @@ async function flushPendingUpdates(docId: string) {
             },
         });
         meta.updateRowsSinceCompact += 1;
+        console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
     } catch (error) {
         console.error(`[Persistence] Failed to flush updates for ${docId}:`, error);
         // Pivot: put them back? or just log error? For now, log.
@@ -67,6 +70,8 @@ async function flushPendingUpdates(docId: string) {
 
 export function scheduleFlush(docId: string) {
     const meta = getOrCreateMeta(docId);
+
+    console.log(`[Schedule] Scheduling flush for ${docId}, pending: ${meta.pending.length}`);
 
     if (meta.flushTimer) clearTimeout(meta.flushTimer);
     meta.flushTimer = setTimeout(() => {
