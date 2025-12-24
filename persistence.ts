@@ -23,7 +23,7 @@ const DEBOUNCE_DELAY_MS = 50;
 const COMPACTION_INTERVAL_MS = 10_000;
 
 /** Origin identifier for updates applied from persistence layer. */
-const YJS_ORIGIN_PERSISTENCE = "persistence";
+export const YJS_ORIGIN_PERSISTENCE = "persistence";
 
 // ---- CIA Level Mappings ----
 
@@ -72,16 +72,16 @@ function parseCiaLevel(value: CiaLevelValue): CiaLevel {
 interface DocumentMetadata {
     /** Array of pending updates waiting to be flushed to the database. */
     pendingUpdates: Uint8Array[];
-    
+
     /** Timer for debounced flush operations. */
     flushTimer: NodeJS.Timeout | null;
-    
+
     /** Timer for periodic compaction operations. */
     compactionTimer: NodeJS.Timeout | null;
-    
+
     /** Number of update rows written since the last compaction. */
     updatesSinceLastCompaction: number;
-    
+
     /** Reference to the Yjs document for CIA synchronization. */
     yjsDocument?: Y.Doc;
 }
@@ -157,7 +157,7 @@ async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array): Pro
 async function syncDocumentCIAValues(docId: string, doc: Y.Doc): Promise<void> {
     const ciaMap = doc.getMap('cia');
     const rawCia = ciaMap.toJSON();
-    
+
     const confidentiality = parseCiaLevel(rawCia.confidentiality);
     const integrity = parseCiaLevel(rawCia.integrity);
     const availability = parseCiaLevel(rawCia.availability);
@@ -200,7 +200,7 @@ function logPersistenceError(operation: string, docId: string, error: unknown): 
  */
 async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
     const meta = documentMetadataMap.get(docId);
-    
+
     if (!meta || meta.pendingUpdates.length === 0) {
         // Even if no pending binary updates, sync CIA values if we have the document
         if (doc) {
@@ -213,7 +213,7 @@ async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
 
     // Merge pending updates into a single blob
     const merged = await mergePendingUpdates(meta);
-    
+
     if (merged === null) {
         return;
     }
@@ -328,7 +328,7 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
 
     try {
         console.log(`[Compaction] Executing transaction for ${docId}`);
-        
+
         // Transaction: Save Snapshot + Delete Updates
         await prisma.$transaction([
             prisma.documentSnapshot.upsert({

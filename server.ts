@@ -30,7 +30,6 @@ const SERVER_PORT = 3000;
 
 // ---- WebSocket Configuration ----
 const WEBSOCKET_PATH_PREFIX = "/yjs/";
-const YJS_ORIGIN_PERSISTENCE = "persistence";
 
 // ---- Persistence Configuration ----
 const PERSISTENCE_MARKER_PREFIX = "__yjs_persistence_";
@@ -74,44 +73,6 @@ const bindStateLocks = new Map<string, DocumentLockPromise>();
 const app = next({ dev: IS_DEVELOPMENT, hostname: SERVER_HOSTNAME, port: SERVER_PORT });
 const handle = app.getRequestHandler();
 
-/**
- * Attempts to acquire an initialization lock for a document.
- * Returns true if the document is already initialized by another process.
- */
-async function waitForDocumentInitialization(
-    docName: string,
-    doc: Doc,
-    persistenceKey: string
-): Promise<boolean> {
-    const existingLock = bindStateLocks.get(docName);
-    
-    if (existingLock !== undefined) {
-        console.log(`[bindState] Waiting for existing initialization: ${docName}`);
-        await existingLock;
-    }
-
-    return hasPersistenceAttached(doc, persistenceKey);
-}
-
-/**
- * Creates a new initialization lock promise for a document.
- */
-function createInitializationLock(docName: string): DocumentLockPromise {
-    let resolveLock: () => void;
-    const lockPromise = new Promise<void>((resolve) => {
-        resolveLock = resolve;
-    });
-    bindStateLocks.set(docName, lockPromise);
-    return lockPromise;
-}
-
-/**
- * Releases the initialization lock for a document.
- */
-function releaseInitializationLock(docName: string, resolveLock: () => void): void {
-    bindStateLocks.delete(docName);
-    resolveLock();
-}
 
 app.prepare().then(() => {
     const server = createServer((req, res) => {
@@ -126,7 +87,7 @@ app.prepare().then(() => {
     // This must be done before any WebSocket connections
     setPersistence({
         provider: null,
-        
+
         /**
          * Binds persistence to a Yjs document.
          * This is called when a document is first accessed.
@@ -137,31 +98,28 @@ app.prepare().then(() => {
             // Use a document-specific persistence key for robustness
             const persistenceKey = createPersistenceMarker(docName);
 
-            // Check if another bindState is in progress for this doc
-            const alreadyInitialized = await waitForDocumentInitialization(docName, doc, persistenceKey);
-            if (alreadyInitialized) {
-                console.log(`[bindState] Already initialized by another call: ${docName}`);
-                return;
+            // Wait for any existing initialization
+            const existingLock = bindStateLocks.get(docName);
+            if (existingLock) {
+                console.log(`[bindState] Waiting for existing initialization: ${docName}`);
+                await existingLock;
+                if (hasPersistenceAttached(doc, persistenceKey)) {
+                    console.log(`[bindState] Already initialized by another call: ${docName}`);
+                    return;
+                }
             }
 
-            // If already attached, skip (handles case where doc was reused)
-            if (hasPersistenceAttached(doc, persistenceKey)) {
-                console.log(`[bindState] Already attached, skipping: ${docName}`);
-                return;
-            }
-
-            // Create a lock promise for this initialization
-            const lockPromise = createInitializationLock(docName);
-            let resolveLock: () => void = () => {};
-            const lock = new Promise<void>((resolve) => {
+            // Create lock with proper resolver pattern
+            let resolveLock!: () => void;
+            const lockPromise = new Promise<void>((resolve) => {
                 resolveLock = resolve;
             });
-            bindStateLocks.set(docName, lock);
+            bindStateLocks.set(docName, lockPromise);
 
             try {
-                // Double-check after acquiring lock (another concurrent call may have finished)
+                // Double-check after acquiring lock
                 if (hasPersistenceAttached(doc, persistenceKey)) {
-                    console.log(`[bindState] Already attached after lock, skipping: ${docName}`);
+                    console.log(`[bindState] Already attached, skipping: ${docName}`);
                     return;
                 }
 
@@ -170,7 +128,7 @@ app.prepare().then(() => {
                 console.log(`[bindState] Attaching update listener for: ${docName}`);
 
                 doc.on("update", (update: Uint8Array, origin: unknown) => {
-                    if (origin === YJS_ORIGIN_PERSISTENCE) return;
+                    if (origin === persistence.YJS_ORIGIN_PERSISTENCE) return;
 
                     console.log(`[Update] Captured for ${docName}, size: ${update.byteLength}`);
 
@@ -188,10 +146,11 @@ app.prepare().then(() => {
                 persistence.startCompactionTimer(docName, doc);
             } finally {
                 // Release the lock
-                releaseInitializationLock(docName, resolveLock);
+                bindStateLocks.delete(docName);
+                resolveLock();
             }
         },
-        
+
         /**
          * Writes final state when the last connection closes.
          */

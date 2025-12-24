@@ -15,6 +15,7 @@
 7. [Challenges & Solutions](#7-challenges--solutions-the-gotchas)
 8. [Final Recommendations](#8-final-recommendations-for-students)
 9. [Offline Editing](#9-offline-editing)
+10. [Authentication & Authorization with Auth.js & Entra ID](#10-authentication--authorization-with-authjs--entra-id)
 
 ---
 
@@ -969,6 +970,181 @@ With offline support, update your UI to reflect the connection state:
 ```
 
 Both providers sync with the same `Y.Doc`. When offline, IndexedDB preserves all changes. When reconnected, Yjs's CRDT magic merges everything automatically.
+
+---
+
+## 10. Authentication & Authorization with Auth.js & Entra ID
+
+As you move from demo to production, securing your collaborative rooms becomes priority #1. We leverage **Auth.js (formerly NextAuth.js)** with **Microsoft Entra ID** to ensure only authorized users can connect to the WebSocket server.
+
+### 10.1 Configuring Microsoft Entra ID
+
+First, you must register your application in the [Microsoft Entra admin center](https://entra.microsoft.com/):
+
+1.  **Register App**: Identity > Applications > App Registrations > New Registration.
+2.  **Name**: Give it a descriptive name (e.g., `Risk Assessment App`).
+3.  **Redirect URI**: Select "Web" and add:
+    `http://localhost:3000/api/auth/callback/microsoft-entra-id`
+4.  **Secrets**: Go to "Certificates & secrets", create a "New client secret", and copy the value immediately.
+5.  **IDs**: Copy the "Application (client) ID" and "Directory (tenant) ID" from the Overview page.
+
+### 10.2 Next.js Integration (Auth.js v5)
+
+Install the necessary dependencies:
+
+```bash
+npm install next-auth@beta @auth/core
+```
+
+Configure your `auth.ts` (or `api/auth/[...nextauth]/route.ts`):
+
+```typescript
+// auth.ts
+import NextAuth from "next-auth"
+import EntraID from "next-auth/providers/microsoft-entra-id"
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [
+    EntraID({
+      clientId: process.env.AUTH_MICROSOFT_ENTRA_ID_ID,
+      clientSecret: process.env.AUTH_MICROSOFT_ENTRA_ID_SECRET,
+      issuer: process.env.AUTH_MICROSOFT_ENTRA_ID_ISSUER,
+    }),
+  ],
+  session: { strategy: "jwt" }, // JWT is required for WebSocket bridging
+})
+```
+
+Add your environment variables:
+
+```env
+AUTH_SECRET="your-secret-key"
+AUTH_MICROSOFT_ENTRA_ID_ID="your-client-id"
+AUTH_MICROSOFT_ENTRA_ID_SECRET="your-client-secret"
+AUTH_MICROSOFT_ENTRA_ID_ISSUER="https://login.microsoftonline.com/{tenant-id}/v2.0"
+```
+
+### 10.3 Securing WebSockets (The WebSocket Bridge)
+
+The standard `auth()` helper works great for HTTP requests, but WebSockets are tricky. The browsers' standard `WebSocket` API **does not support custom headers**, so you cannot easily pass a Bearer token.
+
+**The Solution**: When the browser initiates the WebSocket connection, it sends an HTTP `GET` request with an `Upgrade` header. This request **includes cookies**. We can use `decode` from `next-auth/jwt` to verify the session cookie manually on the server.
+
+**Implementation: Custom Server Authentication**
+
+```javascript
+// server.js
+const { decode } = require("next-auth/jwt");
+const { parse } = require("cookie");
+
+server.on('upgrade', async (request, socket, head) => {
+  try {
+    // 1. Parse cookies from the upgrade request
+    const cookies = parse(request.headers.cookie || "");
+    const sessionToken = cookies["authjs.session-token"] || cookies["__Secure-authjs.session-token"];
+
+    if (!sessionToken) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // 2. Decode and verify the JWT
+    const user = await decode({
+      token: sessionToken,
+      secret: process.env.AUTH_SECRET,
+    });
+
+    if (!user) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // 3. Attach user info to the request for later use in setupWSConnection
+    request.user = user;
+
+    // 4. Continue with regular upgrade
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } catch (err) {
+    socket.destroy();
+  }
+});
+```
+
+### 10.4 Client-Side Identity & Awareness
+
+Once authenticated, your client should pass the user's name and email to the Yjs Awareness protocol so other users can see who is editing.
+
+```typescript
+// RiskAssessmentEditor.tsx
+import { useSession } from "next-auth/react";
+
+function Editor() {
+  const { data: session } = useSession();
+
+  useEffect(() => {
+    if (session?.user && provider) {
+      provider.awareness.setLocalStateField('user', {
+        name: session.user.name,
+        email: session.user.email,
+        color: getUserColor(session.user.email), // Stable color based on email
+      });
+    }
+  }, [session, provider]);
+}
+```
+
+### 10.5 Authorization & Access Control (The "Missing Link")
+
+Authentication tells you **who** the user is, but Authorization tells you **what they can do**. In a collaborative app, you must verify that the authenticated user has permission to access the specific document they are requesting.
+
+**The Authorization Flow**:
+1.  Extract the `docId` from the WebSocket URL.
+2.  Lookup the user's permissions in your database.
+3.  Reject the connection *before* the upgrade if unauthorized.
+
+**Implementation: Upgrade Handler with DB Check**
+
+```javascript
+// server.ts (continuing from the upgrade handler)
+server.on('upgrade', async (request, socket, head) => {
+  // ... Authentication logic from 10.3 ...
+  const user = await decode({ token: sessionToken, secret: process.env.AUTH_SECRET });
+
+  // 1. Extract Document ID from URL (e.g., /doc/xyz)
+  const { pathname } = parse(request.url);
+  const docId = pathname.split('/').pop();
+
+  // 2. Database Check (Example using Prisma)
+  const hasAccess = await prisma.documentPermission.findFirst({
+    where: {
+      documentId: docId,
+      userId: user.sub, // 'sub' is the unique user ID from Auth.js
+      role: { in: ['OWNER', 'EDITOR', 'VIEWER'] }
+    }
+  });
+
+  if (!hasAccess) {
+    socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  // 3. Success! Allow the connection
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
+  });
+});
+```
+
+> [!TIP]
+> **Performance Tip**: Since the `upgrade` handler is called for every connection, cache the authorization results in **Redis** with a short TTL (e.g., 5 minutes) to avoid hitting your primary database on every reconnect.
+
+> [!IMPORTANT]
+> Always use a central `AUTH_SECRET` shared between your Next.js application and your custom WebSocket server. If they don't share the same secret, the WebSocket server won't be able to decode the session cookie generated by Next.js.
 
 ---
 
