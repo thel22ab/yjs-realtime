@@ -1,83 +1,166 @@
 // persistence.ts
-// Handles SQLite persistence for Yjs documents using Prisma 7
+/**
+ * Handles SQLite persistence for Yjs documents using Prisma 7.
+ * 
+ * This module provides:
+ * - Document metadata tracking with pending updates
+ * - Debounced flush operations for batched writes
+ * - Periodic compaction to optimize storage
+ * - CIA (Confidentiality, Integrity, Availability) synchronization
+ * 
+ * @module persistence
+ */
 
 import * as Y from "yjs";
 import prisma from "./lib/db";
 
-// ---- Tuning Constants ----
-const DEBOUNCE_MS = 50;
-const COMPACTION_INTERVAL_MS = 10_000; // 10 seconds for testing (normally 60_000)
+// ---- Configuration Constants ----
 
-// ---- In-memory Document Metadata ----
-interface DocMeta {
-    pending: Uint8Array[];
-    flushTimer: NodeJS.Timeout | null;
-    compactTimer: NodeJS.Timeout | null;
-    updateRowsSinceCompact: number;
+/** Delay in milliseconds for debouncing flush operations. */
+const DEBOUNCE_DELAY_MS = 50;
+
+/** Interval in milliseconds for periodic compaction (10 seconds for testing, normally 60000). */
+const COMPACTION_INTERVAL_MS = 10_000;
+
+/** Origin identifier for updates applied from persistence layer. */
+const YJS_ORIGIN_PERSISTENCE = "persistence";
+
+// ---- CIA Level Mappings ----
+
+/**
+ * CIA level string values from the Yjs document.
+ */
+type CiaLevelValue = string | undefined;
+
+/**
+ * CIA level enumeration for internal calculations.
+ */
+enum CiaLevel {
+    NotSet = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
 }
 
-const docMeta = new Map<string, DocMeta>();
+/**
+ * Maps a CIA string value to its numeric level.
+ * 
+ * @param value - The CIA level string ('Low', 'Medium', 'High', 'Critical')
+ * @returns The numeric level (0-3), where 0 means not set
+ */
+function parseCiaLevel(value: CiaLevelValue): CiaLevel {
+    switch (value) {
+        case 'Low':
+            return CiaLevel.Low;
+        case 'Medium':
+            return CiaLevel.Medium;
+        case 'High':
+            return CiaLevel.High;
+        case 'Critical':
+            return CiaLevel.High; // Map Critical to High (3)
+        default:
+            return CiaLevel.NotSet;
+    }
+}
 
-export function getOrCreateMeta(docId: string): DocMeta {
-    let meta = docMeta.get(docId);
+// ---- In-memory Document Metadata ----
+
+/**
+ * Metadata tracked for each active document.
+ * Manages pending updates, timers, and compaction state.
+ */
+interface DocumentMetadata {
+    /** Array of pending updates waiting to be flushed to the database. */
+    pendingUpdates: Uint8Array[];
+    
+    /** Timer for debounced flush operations. */
+    flushTimer: NodeJS.Timeout | null;
+    
+    /** Timer for periodic compaction operations. */
+    compactionTimer: NodeJS.Timeout | null;
+    
+    /** Number of update rows written since the last compaction. */
+    updatesSinceLastCompaction: number;
+    
+    /** Reference to the Yjs document for CIA synchronization. */
+    yjsDocument?: Y.Doc;
+}
+
+/** Map of document IDs to their metadata. */
+const documentMetadataMap = new Map<string, DocumentMetadata>();
+
+/**
+ * Retrieves existing metadata for a document or creates new metadata if none exists.
+ * 
+ * @param docId - The unique identifier for the document
+ * @param yjsDoc - Optional Yjs document reference to associate with the metadata
+ * @returns The document metadata
+ */
+export function getOrCreateMeta(docId: string, yjsDoc?: Y.Doc): DocumentMetadata {
+    let meta = documentMetadataMap.get(docId);
     if (!meta) {
         meta = {
-            pending: [],
+            pendingUpdates: [],
             flushTimer: null,
-            compactTimer: null,
-            updateRowsSinceCompact: 0,
+            compactionTimer: null,
+            updatesSinceLastCompaction: 0,
+            yjsDocument: yjsDoc,
         };
-        docMeta.set(docId, meta);
+        documentMetadataMap.set(docId, meta);
+    } else if (yjsDoc) {
+        // Update document reference if provided
+        meta.yjsDocument = yjsDoc;
     }
     return meta;
 }
 
-// ---- Persistence Functions ----
+// ---- Persistence Helper Functions ----
 
-async function flushPendingUpdates(docId: string, doc?: Y.Doc) {
-    const meta = docMeta.get(docId);
-    if (!meta || meta.pending.length === 0) {
-        // Even if no pending binary updates, if we have the doc, we might want to sync CIA values
-        if (doc) {
-            await updateDocumentCia(docId, doc);
-        }
-        return;
+/**
+ * Merges all pending updates for a document into a single update blob.
+ * 
+ * @param meta - The document metadata containing pending updates
+ * @returns The merged update blob, or null if no updates are pending
+ */
+async function mergePendingUpdates(meta: DocumentMetadata): Promise<Uint8Array | null> {
+    if (meta.pendingUpdates.length === 0) {
+        return null;
     }
-
-    console.log(`[Flush] Flushing ${meta.pending.length} updates for ${docId}`);
-
-    // Merge pending updates into a single blob
-    const merged = Y.mergeUpdates(meta.pending);
-
-    try {
-        await prisma.documentUpdate.create({
-            data: {
-                documentId: docId,
-                update: Buffer.from(merged),
-                createdAt: BigInt(Date.now()),
-            },
-        });
-        // Only clear pending after successful write to prevent data loss
-        meta.pending = [];
-        meta.updateRowsSinceCompact += 1;
-        console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
-
-        // Also update CIA values in the sidecar document table
-        if (doc) {
-            await updateDocumentCia(docId, doc);
-        }
-    } catch (error) {
-        console.error(`[Persistence] Failed to flush updates for ${docId}:`, error);
-    }
+    return Y.mergeUpdates(meta.pendingUpdates);
 }
 
-// Helper to update CIA values specifically
-async function updateDocumentCia(docId: string, doc: Y.Doc) {
+/**
+ * Persists a merged update blob to the database.
+ * 
+ * @param docId - The document identifier
+ * @param mergedUpdate - The merged update blob to persist
+ * @returns A promise that resolves when the update is persisted
+ */
+async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array): Promise<void> {
+    await prisma.documentUpdate.create({
+        data: {
+            documentId: docId,
+            update: Buffer.from(mergedUpdate),
+            createdAt: BigInt(Date.now()),
+        },
+    });
+}
+
+/**
+ * Synchronizes CIA (Confidentiality, Integrity, Availability) values
+ * from the Yjs document to the database.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document containing CIA values
+ * @returns A promise that resolves when CIA values are synchronized
+ */
+async function syncDocumentCIAValues(docId: string, doc: Y.Doc): Promise<void> {
     const ciaMap = doc.getMap('cia');
     const rawCia = ciaMap.toJSON();
-    const confidentiality = ciaStringToInt(rawCia.confidentiality);
-    const integrity = ciaStringToInt(rawCia.integrity);
-    const availability = ciaStringToInt(rawCia.availability);
+    
+    const confidentiality = parseCiaLevel(rawCia.confidentiality);
+    const integrity = parseCiaLevel(rawCia.integrity);
+    const availability = parseCiaLevel(rawCia.availability);
 
     try {
         await prisma.document.update({
@@ -90,85 +173,174 @@ async function updateDocumentCia(docId: string, doc: Y.Doc) {
         });
         console.log(`[CIA Sync] Updated ${docId}: C=${confidentiality} I=${integrity} A=${availability}`);
     } catch (error) {
-        console.error(`[CIA Sync] FAILED for ${docId}:`, error);
+        console.error(`[CIA Sync] Failed for ${docId}:`, error);
     }
 }
 
-export function scheduleFlush(docId: string, doc: Y.Doc) {
-    const meta = getOrCreateMeta(docId);
+/**
+ * Logs an error with consistent formatting for persistence operations.
+ * 
+ * @param operation - The name of the operation that failed
+ * @param docId - The document identifier
+ * @param error - The error that occurred
+ */
+function logPersistenceError(operation: string, docId: string, error: unknown): void {
+    console.error(`[Persistence][${operation}] Failed for ${docId}:`, error);
+}
 
-    console.log(`[Schedule] Scheduling flush for ${docId}, pending: ${meta.pending.length}`);
+// ---- Core Persistence Operations ----
 
-    if (meta.flushTimer) clearTimeout(meta.flushTimer);
+/**
+ * Flushes all pending updates for a document to the database.
+ * This includes merging updates, persisting them, and syncing CIA values.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document containing updates
+ * @returns A promise that resolves when flushing is complete
+ */
+async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
+    const meta = documentMetadataMap.get(docId);
+    
+    if (!meta || meta.pendingUpdates.length === 0) {
+        // Even if no pending binary updates, sync CIA values if we have the document
+        if (doc) {
+            await syncDocumentCIAValues(docId, doc);
+        }
+        return;
+    }
+
+    console.log(`[Flush] Flushing ${meta.pendingUpdates.length} updates for ${docId}`);
+
+    // Merge pending updates into a single blob
+    const merged = await mergePendingUpdates(meta);
+    
+    if (merged === null) {
+        return;
+    }
+
+    try {
+        await persistMergedUpdate(docId, merged);
+        // Only clear pending after successful write to prevent data loss
+        meta.pendingUpdates = [];
+        meta.updatesSinceLastCompaction += 1;
+        console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
+
+        // Also update CIA values in the sidecar document table
+        await syncDocumentCIAValues(docId, doc!);
+    } catch (error) {
+        logPersistenceError('Flush', docId, error);
+    }
+}
+
+/**
+ * Schedules a debounced flush of pending updates for a document.
+ * 
+ * This function implements a debouncing pattern to batch multiple rapid
+ * updates into a single database write, improving performance.
+ * 
+ * @param docId - The unique identifier for the document
+ * @param doc - The Yjs document containing updates to flush
+ * 
+ * @example
+ * ```typescript
+ * doc.on('update', (update) => {
+ *     const meta = getOrCreateMeta(docId, doc);
+ *     meta.pendingUpdates.push(update);
+ *     scheduleFlush(docId, doc);
+ * });
+ * ```
+ */
+export function scheduleFlush(docId: string, doc: Y.Doc): void {
+    const meta = getOrCreateMeta(docId, doc);
+
+    console.log(`[Schedule] Scheduling flush for ${docId}, pending: ${meta.pendingUpdates.length}`);
+
+    if (meta.flushTimer) {
+        clearTimeout(meta.flushTimer);
+    }
     meta.flushTimer = setTimeout(() => {
         meta.flushTimer = null;
         void flushPendingUpdates(docId, doc);
-    }, DEBOUNCE_MS);
+    }, DEBOUNCE_DELAY_MS);
 }
 
-export function startCompactionTimer(docId: string, doc: Y.Doc) {
-    const meta = getOrCreateMeta(docId);
-    if (meta.compactTimer) return;
+/**
+ * Starts the periodic compaction timer for a document.
+ * Compaction merges all incremental updates into a single snapshot.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to compact
+ */
+export function startCompactionTimer(docId: string, doc: Y.Doc): void {
+    const meta = getOrCreateMeta(docId, doc);
+    if (meta.compactionTimer) {
+        return;
+    }
 
-    meta.compactTimer = setInterval(() => {
-        void compactDoc(docId, doc);
+    meta.compactionTimer = setInterval(() => {
+        void compactDocument(docId, doc);
     }, COMPACTION_INTERVAL_MS);
 }
 
-export function stopCompactionTimer(docId: string) {
-    const meta = docMeta.get(docId);
-    if (!meta) return;
+/**
+ * Stops all timers associated with a document and cleans up metadata.
+ * 
+ * @param docId - The document identifier
+ */
+export function stopCompactionTimer(docId: string): void {
+    const meta = documentMetadataMap.get(docId);
+    if (!meta) {
+        return;
+    }
 
-    if (meta.compactTimer) {
-        clearInterval(meta.compactTimer);
-        meta.compactTimer = null;
+    if (meta.compactionTimer) {
+        clearInterval(meta.compactionTimer);
+        meta.compactionTimer = null;
     }
     if (meta.flushTimer) {
         clearTimeout(meta.flushTimer);
         meta.flushTimer = null;
     }
 
-    // clean up meta
-    docMeta.delete(docId);
+    // Clean up metadata
+    documentMetadataMap.delete(docId);
 }
 
-// Convert CIA string value to integer (0-3)
-function ciaStringToInt(value: unknown): number {
-    switch (value) {
-        case 'Low': return 1;
-        case 'Medium': return 2;
-        case 'High': return 3;
-        case 'Critical': return 3; // Map Critical to High (3)
-        default: return 0; // Not set
-    }
-}
+/**
+ * Compacts a document by creating a snapshot and clearing incremental updates.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to compact
+ */
+async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
+    const meta = documentMetadataMap.get(docId);
 
-async function compactDoc(docId: string, doc: Y.Doc) {
-    const meta = docMeta.get(docId);
-
-    // Ensure everything pending is written first (optional, but good practice)
+    // Ensure everything pending is written first
     await flushPendingUpdates(docId, doc);
 
-    if (meta && meta.updateRowsSinceCompact === 0) return;
+    if (meta && meta.updatesSinceLastCompaction === 0) {
+        return;
+    }
 
     const snapshot = Y.encodeStateAsUpdate(doc);
-    const snapshotBuf = Buffer.from(snapshot);
-    const now = BigInt(Date.now());
+    const snapshotBuffer = Buffer.from(snapshot);
+    const currentTimestamp = BigInt(Date.now());
 
     try {
         console.log(`[Compaction] Executing transaction for ${docId}`);
+        
         // Transaction: Save Snapshot + Delete Updates
         await prisma.$transaction([
             prisma.documentSnapshot.upsert({
                 where: { documentId: docId },
                 update: {
-                    snapshot: snapshotBuf,
-                    updatedAt: now,
+                    snapshot: snapshotBuffer,
+                    updatedAt: currentTimestamp,
                 },
                 create: {
                     documentId: docId,
-                    snapshot: snapshotBuf,
-                    updatedAt: now,
+                    snapshot: snapshotBuffer,
+                    updatedAt: currentTimestamp,
                 },
             }),
             prisma.documentUpdate.deleteMany({
@@ -176,59 +348,79 @@ async function compactDoc(docId: string, doc: Y.Doc) {
             }),
         ]);
 
-        // Also update CIA values to be sure they are in sync
-        await updateDocumentCia(docId, doc);
+        // Also update CIA values to ensure they are in sync
+        await syncDocumentCIAValues(docId, doc);
 
-        if (meta) meta.updateRowsSinceCompact = 0;
+        if (meta) {
+            meta.updatesSinceLastCompaction = 0;
+        }
 
         console.log(`[Compaction] Success: ${docId}`);
     } catch (error) {
-        console.error(`[Compaction] FAILED for ${docId}:`, error);
+        logPersistenceError('Compaction', docId, error);
     }
 }
 
-// Public function to save and compact a document (called when document is closed)
-export async function saveAndCompact(docId: string, doc: Y.Doc) {
+// ---- Public API ----
+
+/**
+ * Saves and compacts a document.
+ * Called when a document is closed or the server is shutting down.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to save
+ */
+export async function saveAndCompact(docId: string, doc: Y.Doc): Promise<void> {
     console.log(`[SaveAndCompact] Saving document on close: ${docId}`);
 
     // Flush any pending updates and update CIA values
     await flushPendingUpdates(docId, doc);
 
     // Force compaction regardless of updateRowsSinceCompact
-    const meta = docMeta.get(docId);
+    const meta = documentMetadataMap.get(docId);
     if (meta) {
         // Temporarily set to 1 to force compaction if needed
-        const hadUpdates = meta.updateRowsSinceCompact;
-        meta.updateRowsSinceCompact = 1;
-        await compactDoc(docId, doc);
+        const hadUpdates = meta.updatesSinceLastCompaction;
+        meta.updatesSinceLastCompaction = 1;
+        await compactDocument(docId, doc);
         if (hadUpdates === 0) {
-            // Still log that we saved even if no new updates
+            // Log that we saved even if no new updates
             console.log(`[SaveAndCompact] Document ${docId} saved (no pending updates)`);
         }
     } else {
         // No meta means fresh document, still try to compact
-        await compactDoc(docId, doc);
+        await compactDocument(docId, doc);
     }
 }
 
-// Force an immediate flush and sync for a doc if it exists in memory
-export async function forceFlush(docId: string, doc: Y.Doc) {
+/**
+ * Forces an immediate flush and compaction for a document.
+ * Useful for testing or critical save operations.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to flush
+ */
+export async function forceFlush(docId: string, doc: Y.Doc): Promise<void> {
     console.log(`[ForceFlush] Force saving document: ${docId}`);
     await flushPendingUpdates(docId, doc);
-    await compactDoc(docId, doc);
+    await compactDocument(docId, doc);
 }
 
-export async function loadDocFromDb(docId: string, doc: Y.Doc) {
-    const ORIGIN = "persistence";
-
+/**
+ * Loads a document's persisted state from the database.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to populate with persisted data
+ */
+export async function loadDocFromDb(docId: string, doc: Y.Doc): Promise<void> {
     try {
         // Load Snapshot
-        const snap = await prisma.documentSnapshot.findUnique({
+        const snapshotRecord = await prisma.documentSnapshot.findUnique({
             where: { documentId: docId },
         });
 
-        if (snap?.snapshot) {
-            Y.applyUpdate(doc, new Uint8Array(snap.snapshot), ORIGIN);
+        if (snapshotRecord?.snapshot) {
+            Y.applyUpdate(doc, new Uint8Array(snapshotRecord.snapshot), YJS_ORIGIN_PERSISTENCE);
         }
 
         // Load Updates
@@ -238,29 +430,42 @@ export async function loadDocFromDb(docId: string, doc: Y.Doc) {
         });
 
         for (const row of updates) {
-            Y.applyUpdate(doc, new Uint8Array(row.update), ORIGIN);
+            Y.applyUpdate(doc, new Uint8Array(row.update), YJS_ORIGIN_PERSISTENCE);
         }
 
         if (updates.length > 0) {
             console.log(`[Load] Applied ${updates.length} update rows for ${docId}`);
         }
     } catch (error) {
-        console.error(`[Load] Failed to load doc ${docId}:`, error);
+        logPersistenceError('Load', docId, error);
     }
 }
 
-export async function shutdown() {
+/**
+ * Shuts down the persistence layer gracefully.
+ * Flushes all pending updates and stops all timers.
+ * 
+ * @returns A promise that resolves when shutdown is complete
+ */
+export async function shutdown(): Promise<void> {
     // Flush any pending buffered updates
-    const flushPromises = [];
-    for (const [docId] of docMeta) {
-        flushPromises.push(flushPendingUpdates(docId));
+    const flushPromises: Promise<void>[] = [];
+    for (const [docId, meta] of documentMetadataMap) {
+        // Pass the tracked document object to ensure CIA values are synced
+        if (meta.yjsDocument) {
+            flushPromises.push(flushPendingUpdates(docId, meta.yjsDocument));
+        }
     }
     await Promise.all(flushPromises);
 
     // Stop compaction timers
-    for (const [, meta] of docMeta) {
-        if (meta.compactTimer) clearInterval(meta.compactTimer);
-        if (meta.flushTimer) clearTimeout(meta.flushTimer);
+    for (const [, meta] of documentMetadataMap) {
+        if (meta.compactionTimer) {
+            clearInterval(meta.compactionTimer);
+        }
+        if (meta.flushTimer) {
+            clearTimeout(meta.flushTimer);
+        }
     }
 
     await prisma.$disconnect();

@@ -833,6 +833,36 @@ ySyncPlugin(yXmlFragment);  // Works correctly
 
 ---
 
+### Issue 7: Shutdown Flush - Missing Doc Objects
+
+**Problem**: During server shutdown, we call `persistence.shutdown()` to flush buffered updates to the database. However, the `shutdown()` function was only passing the `docId` to `flushPendingUpdates()`, not the `Y.Doc` object itself.
+
+**Impact**: Because `flushPendingUpdates()` needs the `Y.Doc` to extract and sync "sidecar" metadata (like CIA security labels), these values were NOT being synced during a graceful shutdown. Only the binary Yjs updates were saved.
+
+**Solution**: Track the active `Y.Doc` objects within the persistence layer metadata.
+
+```typescript
+// persistence.ts
+interface DocMeta {
+    pending: Uint8Array[];
+    doc?: Y.Doc; // Track doc object
+    // ...
+}
+
+export async function shutdown() {
+    for (const [docId, meta] of docMeta) {
+        // Now we can pass meta.doc to ensure CIA sync!
+        await flushPendingUpdates(docId, meta.doc);
+    }
+}
+```
+
+**Key Takeaway**: When building persistence for Yjs, distinguish between the **binary state** (CRDT) and **sidecar metadata** (SQL columns). Ensure your shutdown handlers have access to the full document object if they need to sync both.
+
+---
+
+---
+
 ## 8. Final Recommendations for Students
 
 ### Getting Started

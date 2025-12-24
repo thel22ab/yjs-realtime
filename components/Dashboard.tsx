@@ -1,3 +1,12 @@
+/**
+ * Dashboard Component
+ * 
+ * Displays a list of risk assessment documents with options to
+ * create new assessments and delete existing ones.
+ * 
+ * @component
+ */
+
 'use client';
 
 import { createDocument, getDocuments, deleteDocument } from '@/app/actions/documents';
@@ -16,69 +25,113 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Trash2, CheckCircle2, Loader2 } from 'lucide-react';
 
-interface Document {
+// ---- Types ----
+
+/**
+ * Document summary displayed in the dashboard list.
+ */
+interface DocumentSummary {
     id: string;
     title: string;
     confidentiality: number;
     integrity: number;
     availability: number;
-    created_at: string;
+    createdAt: string;
 }
 
-// Helper to get color based on CIA level (0-3)
-function getCIAColor(value: number): string {
-    switch (value) {
-        case 0: return 'bg-gray-200 text-gray-600';
-        case 1: return 'bg-green-100 text-green-700';
-        case 2: return 'bg-yellow-100 text-yellow-700';
-        case 3: return 'bg-red-100 text-red-700';
-        default: return 'bg-gray-200 text-gray-600';
-    }
+// ---- CIA Display Helpers ----
+
+/**
+ * CIA numeric level type (0-3 based on database schema).
+ */
+type CiaLevel = 0 | 1 | 2 | 3;
+
+/**
+ * Maps CIA level number to CSS color class for badge styling.
+ */
+const CIA_LEVEL_COLORS: Record<CiaLevel, string> = {
+    0: 'bg-gray-200 text-gray-600',
+    1: 'bg-green-100 text-green-700',
+    2: 'bg-yellow-100 text-yellow-700',
+    3: 'bg-red-100 text-red-700',
+};
+
+/**
+ * Maps CIA level number to display label.
+ */
+const CIA_LEVEL_LABELS: Record<CiaLevel, string> = {
+    0: '-',
+    1: 'Low',
+    2: 'Med',
+    3: 'High',
+};
+
+/**
+ * Gets the color class for a CIA level badge.
+ */
+function getCIAColor(level: number): string {
+    const normalizedLevel = Math.min(Math.max(Math.round(level), 0), 3) as CiaLevel;
+    return CIA_LEVEL_COLORS[normalizedLevel];
 }
 
-// Helper to get label for CIA level
-function getCIALabel(value: number): string {
-    switch (value) {
-        case 0: return '-';
-        case 1: return 'Low';
-        case 2: return 'Med';
-        case 3: return 'High';
-        default: return '-';
-    }
+/**
+ * Gets the display label for a CIA level.
+ */
+function getCIALabel(level: number): string {
+    const normalizedLevel = Math.min(Math.max(Math.round(level), 0), 3) as CiaLevel;
+    return CIA_LEVEL_LABELS[normalizedLevel];
 }
 
-export default function Dashboard({ initialDocuments }: { initialDocuments: Document[] }) {
+// ---- Component Props ----
+
+interface DashboardProps {
+    /** Initial documents to display when the component loads. */
+    initialDocuments: DocumentSummary[];
+}
+
+// ---- Component ----
+
+export default function Dashboard({ initialDocuments }: DashboardProps) {
     const router = useRouter();
     const [documents, setDocuments] = useState(initialDocuments);
-    const [deletingDoc, setDeletingDoc] = useState<Document | null>(null);
+    const [deletingDocument, setDeletingDocument] = useState<DocumentSummary | null>(null);
     const [isDeleting, setIsDeleting] = useState(false);
     const [showSuccess, setShowSuccess] = useState(false);
 
-    const handleDeleteClick = (e: React.MouseEvent, doc: Document) => {
-        e.preventDefault();
-        e.stopPropagation();
-        setDeletingDoc(doc);
+    /**
+     * Initiates the delete process for a document.
+     */
+    const handleDeleteClick = (event: React.MouseEvent, doc: DocumentSummary): void => {
+        event.preventDefault();
+        event.stopPropagation();
+        setDeletingDocument(doc);
     };
 
-    const confirmDelete = async () => {
-        if (!deletingDoc) return;
+    /**
+     * Confirms and executes document deletion.
+     */
+    const confirmDelete = async (): Promise<void> => {
+        if (!deletingDocument) return;
 
         setIsDeleting(true);
-        const result = await deleteDocument(deletingDoc.id);
+        const result = await deleteDocument(deletingDocument.id);
 
         if (result.success) {
-            setDocuments(docs => docs.filter(d => d.id !== deletingDoc.id));
+            setDocuments(currentDocs => currentDocs.filter(d => d.id !== deletingDocument.id));
             setIsDeleting(false);
             setShowSuccess(true);
         } else {
             setIsDeleting(false);
             alert('Failed to delete document. Please try again.');
-            setDeletingDoc(null);
+            setDeletingDocument(null);
         }
     };
 
-    const closeModals = () => {
-        setDeletingDoc(null);
+    /**
+     * Closes all modal dialogs and resets state.
+     */
+    const closeModals = (): void => {
+        setDeletingDocument(null);
         setShowSuccess(false);
     };
 
@@ -105,7 +158,9 @@ export default function Dashboard({ initialDocuments }: { initialDocuments: Docu
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {documents.length === 0 ? (
-                    <p className="text-gray-500 col-span-2 text-center py-8">No documents yet. Create one above.</p>
+                    <p className="text-gray-500 col-span-2 text-center py-8">
+                        No documents yet. Create one above.
+                    </p>
                 ) : (
                     documents.map((doc) => (
                         <Link
@@ -137,19 +192,21 @@ export default function Dashboard({ initialDocuments }: { initialDocuments: Docu
                                 </span>
                             </div>
 
-                            <p className="text-sm text-gray-500">Created: {new Date(doc.created_at).toLocaleDateString()}</p>
+                            <p className="text-sm text-gray-500">
+                                Created: {new Date(doc.createdAt).toLocaleDateString()}
+                            </p>
                         </Link>
                     ))
                 )}
             </div>
 
             {/* Confirmation Modal */}
-            <AlertDialog open={!!deletingDoc && !showSuccess} onOpenChange={(open) => !open && closeModals()}>
+            <AlertDialog open={!!deletingDocument && !showSuccess} onOpenChange={(open) => !open && closeModals()}>
                 <AlertDialogContent>
                     <AlertDialogHeader>
                         <AlertDialogTitle>Delete Risk Assessment</AlertDialogTitle>
                         <AlertDialogDescription>
-                            Are you sure you want to delete <strong className="text-foreground">"{deletingDoc?.title}"</strong>?
+                            Are you sure you want to delete <strong className="text-foreground">"{deletingDocument?.title}"</strong>?
                             This action cannot be undone and will remove all associated data.
                         </AlertDialogDescription>
                     </AlertDialogHeader>
@@ -158,7 +215,7 @@ export default function Dashboard({ initialDocuments }: { initialDocuments: Docu
                         <AlertDialogAction
                             onClick={(e) => {
                                 e.preventDefault();
-                                confirmDelete();
+                                void confirmDelete();
                             }}
                             className="bg-red-600 hover:bg-red-700 text-white"
                             disabled={isDeleting}
@@ -200,4 +257,3 @@ export default function Dashboard({ initialDocuments }: { initialDocuments: Docu
         </div>
     );
 }
-

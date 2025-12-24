@@ -25,7 +25,7 @@ describe('Integration Flow', () => {
         // Critical -> 3, Medium -> 2, Low -> 1
         // Note: compactDoc is called inside saveAndCompact. 
         // It's part of a $transaction call.
-        const transactionArg = prismaMock.$transaction.mock.calls[0][0];
+        const transactionArg = prismaMock.$transaction.mock.calls[0][0] as unknown as unknown[];
         // The 3rd item in the transaction is the document update
         // We can verify it by finding the update call in the array
         const docUpdate = transactionArg.find((op: any) => op?._action === 'update' || op?.where?.id === docId);

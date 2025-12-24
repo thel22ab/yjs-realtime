@@ -1,3 +1,15 @@
+/**
+ * Risk Assessment Editor Component
+ * 
+ * Provides a collaborative editor for risk assessments with:
+ * - Real-time collaboration via Yjs and WebSockets
+ * - CIA (Confidentiality, Integrity, Availability) scoring
+ * - Dynamic security control recommendations
+ * - Offline support via IndexedDB
+ * 
+ * @component
+ */
+
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -10,27 +22,185 @@ import { WebsocketProvider } from 'y-websocket';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
 import { useSyncedStore } from '@syncedstore/react';
-import { createStore, getYjsDoc } from '../lib/store';
+import { createStore, getYjsDoc } from '@/lib/store';
 
+// ---- Types ----
+
+/**
+ * Props for the RiskAssessmentEditor component.
+ */
 interface RiskAssessmentEditorProps {
+    /** Unique identifier for the document being edited. */
     documentId: string;
+    
+    /** Name of the user for presence/awareness display. */
     userName: string;
 }
 
-const COLORS = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#818cf8', '#c084fc'];
+// ---- Configuration Constants ----
 
-export default function RiskAssessmentEditor({ documentId, userName }: RiskAssessmentEditorProps) {
+/** Available user cursor colors for collaborative editing. */
+const CURSOR_COLORS = [
+    '#f87171', '#fb923c', '#fbbf24', '#a3e635', 
+    '#34d399', '#22d3ee', '#818cf8', '#c084fc'
+];
+
+/** CIA level values for dropdown selection. */
+const CIA_LEVELS = ['Low', 'Medium', 'High', 'Critical'] as const;
+
+/** Default CIA level when none is selected. */
+const DEFAULT_CIA_LEVEL = 'Low';
+
+// ---- Security Control Catalog ----
+
+/**
+ * Catalog of security controls available for risk assessments.
+ * Controls are dynamically shown based on CIA scores.
+ */
+const SECURITY_CONTROL_CATALOG: Record<string, string> = {
+    encryption_at_rest: 'Data Encryption at Rest',
+    mfa_enforced: 'Multi-Factor Authentication',
+    access_logging: 'Access Logging & Review',
+    disaster_recovery: 'Disaster Recovery Plan',
+    vulnerability_scan: 'Regular Vulnerability Scanning',
+    incident_response: 'Incident Response Protocol',
+};
+
+// ---- CIA Weight Configuration ----
+
+/**
+ * CIA level risk weight mappings.
+ * 
+ * These weights follow industry-standard risk assessment formulas:
+ * - Low (1): Minimal impact requiring standard controls
+ * - Medium (3): Moderate impact requiring enhanced controls  
+ * - High (5): Significant impact requiring strict controls
+ * - Critical (7): Severe impact requiring maximum security measures
+ * 
+ * @see NIST SP 800-30 Risk Assessment Framework
+ */
+const CIA_LEVEL_WEIGHTS: Record<string, number> = {
+    Low: 1,
+    Medium: 3,
+    High: 5,
+    Critical: 7,
+};
+
+/**
+ * CIA level type.
+ */
+type CiaLevel = typeof CIA_LEVELS[number];
+
+/**
+ * Converts a CIA level string to its numeric risk weight.
+ * 
+ * @param level - The CIA level string (e.g., 'High')
+ * @returns The numeric weight for risk calculations
+ */
+function calculateCiaWeight(level: string = DEFAULT_CIA_LEVEL): number {
+    return CIA_LEVEL_WEIGHTS[level] ?? 1;
+}
+
+// ---- Helper Functions ----
+
+/**
+ * Determines which security controls are required based on CIA scores.
+ * 
+ * @param confidentialityScore - Confidentiality risk score
+ * @param integrityScore - Integrity risk score
+ * @param availabilityScore - Availability risk score
+ * @returns Set of control IDs that should be enabled
+ */
+function calculateRequiredControls(
+    confidentialityScore: number,
+    integrityScore: number,
+    availabilityScore: number
+): Set<string> {
+    const totalScore = confidentialityScore + integrityScore + availabilityScore;
+    const requiredControls = new Set<string>();
+
+    // Rule 1: High confidentiality (> 4) requires encryption and access controls
+    if (confidentialityScore > 4) {
+        ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(control => 
+            requiredControls.add(control)
+        );
+    }
+
+    // Rule 2: High total risk (> 12) requires all controls
+    if (totalScore > 12) {
+        Object.keys(SECURITY_CONTROL_CATALOG).forEach(control => 
+            requiredControls.add(control)
+        );
+    }
+
+    return requiredControls;
+}
+
+/**
+ * Selects a random cursor color for the current user.
+ */
+function getRandomCursorColor(): string {
+    return CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)];
+}
+
+/**
+ * Determines connection status display text based on state.
+ */
+function getConnectionStatusText(
+    isOnline: boolean, 
+    connectionStatus: 'connecting' | 'connected' | 'disconnected'
+): string {
+    if (!isOnline) return 'Offline Mode';
+    if (connectionStatus === 'connected') return 'Synchronized';
+    if (connectionStatus === 'connecting') return 'Connecting...';
+    return 'Offline Mode';
+}
+
+/**
+ * Determines CSS class for status indicator based on state.
+ */
+function getStatusIndicatorClass(
+    isOnline: boolean,
+    connectionStatus: 'connecting' | 'connected' | 'disconnected'
+): string {
+    if (!isOnline) return 'bg-amber-500';
+    if (connectionStatus === 'connected') return 'bg-green-500';
+    if (connectionStatus === 'connecting') return 'bg-yellow-500 animate-pulse';
+    return 'bg-amber-500';
+}
+
+/**
+ * Determines CSS class for status text based on state.
+ */
+function getStatusTextClass(
+    isOnline: boolean,
+    connectionStatus: 'connecting' | 'connected' | 'disconnected'
+): string {
+    if (!isOnline) return 'text-amber-700';
+    if (connectionStatus === 'connected') return 'text-green-700';
+    if (connectionStatus === 'connecting') return 'text-yellow-700';
+    return 'text-amber-700';
+}
+
+// ---- Component ----
+
+export default function RiskAssessmentEditor({ 
+    documentId, 
+    userName 
+}: RiskAssessmentEditorProps) {
     const editorRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
+    
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
-    const [users, setUsers] = useState<string[]>([]);
+    const [activeUsers, setActiveUsers] = useState<string[]>([]);
 
-    // Local SyncedStore for this document
+    // Create store instance for this document
     const docStore = useMemo(() => createStore(), [documentId]);
-    const state = useSyncedStore(docStore);
+    const storeState = useSyncedStore(docStore);
 
-    // Listen for browser online/offline events (crucial for DevTools offline simulation)
+    // ---- Online/Offline Detection ----
+
     useEffect(() => {
         const handleOnline = () => setIsOnline(true);
         const handleOffline = () => setIsOnline(false);
@@ -44,26 +214,22 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
         };
     }, []);
 
+    // ---- Editor Initialization ----
+
     useEffect(() => {
         if (!editorRef.current) return;
 
         // Initialize Yjs document from the local store
-        const ydoc = getYjsDoc(docStore);
+        const yjsDocument = getYjsDoc(docStore);
         // Get the raw Yjs XmlFragment directly (not through proxy) for y-prosemirror
-        const yXmlFragment = ydoc.getXmlFragment('prosemirror');
+        const yXmlFragment = yjsDocument.getXmlFragment('prosemirror');
 
         // Connect to WebSocket server
-        // The server expects connections at /yjs/<docId>, so we append /yjs / to the base URL
-        const provider = new WebsocketProvider(
-            (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000') + '/yjs',
-            documentId,
-            ydoc,
-            { connect: true }
-        );
+        const wsUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3000') + '/yjs';
+        const provider = new WebsocketProvider(wsUrl, documentId, yjsDocument, { connect: true });
 
         // IndexedDB persistence for offline support
-
-        const indexeddbProvider = new IndexeddbPersistence(documentId, ydoc);
+        const indexeddbProvider = new IndexeddbPersistence(documentId, yjsDocument);
         indexeddbProvider.on('synced', () => {
             console.log('Local content loaded from IndexedDB');
         });
@@ -74,13 +240,13 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
 
         // Configure awareness for cursor positions
         const awareness = provider.awareness;
-        const color = COLORS[Math.floor(Math.random() * COLORS.length)];
-        awareness.setLocalStateField('user', { name: userName, color });
+        const userColor = getRandomCursorColor();
+        awareness.setLocalStateField('user', { name: userName, color: userColor });
 
         awareness.on('change', () => {
-            const states = Array.from(awareness.getStates().values()) as any[];
-            const activeUsers = states.map(s => s.user?.name).filter(Boolean);
-            setUsers(activeUsers);
+            const states = Array.from(awareness.getStates().values()) as Array<{ user?: { name: string } }>;
+            const users = states.map(s => s.user?.name).filter((name): name is string => Boolean(name));
+            setActiveUsers(users);
         });
 
         // Create ProseMirror editor state
@@ -96,7 +262,6 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
 
         // Initialize editor view
         const view = new EditorView(editorRef.current, { state: editorState });
-
         viewRef.current = view;
 
         // Cleanup on unmount
@@ -105,71 +270,61 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
             provider.destroy();
             view.destroy();
         };
-    }, [documentId, userName]);
+    }, [documentId, userName, docStore]);
 
-    // Cybersecurity control catalog
-    const CONTROL_CATALOG: Record<string, string> = {
-        encryption_at_rest: 'Data Encryption at Rest',
-        mfa_enforced: 'Multi-Factor Authentication',
-        access_logging: 'Access Logging & Review',
-        disaster_recovery: 'Disaster Recovery Plan',
-        vulnerability_scan: 'Regular Vulnerability Scanning',
-        incident_response: 'Incident Response Protocol',
-    };
+    // ---- Dynamic Control Management ----
 
-    // Helper to map CIA levels to numbers
-    const ciaToWeight = (level: string = 'Low'): number => {
-        const weights: Record<string, number> = {
-            Low: 1,
-            Medium: 3,
-            High: 5,
-            Critical: 7,
-        };
-        return weights[level] || 1;
-    };
-
-    // Effect to dynamically add/remove controls based on CIA scores
     useEffect(() => {
-        const cScore = ciaToWeight(state.cia.confidentiality);
-        const iScore = ciaToWeight(state.cia.integrity);
-        const aScore = ciaToWeight(state.cia.availability);
-        const totalScore = cScore + iScore + aScore;
+        const confidentialityScore = calculateCiaWeight(storeState.cia.confidentiality ?? DEFAULT_CIA_LEVEL);
+        const integrityScore = calculateCiaWeight(storeState.cia.integrity ?? DEFAULT_CIA_LEVEL);
+        const availabilityScore = calculateCiaWeight(storeState.cia.availability ?? DEFAULT_CIA_LEVEL);
 
-        const requiredControls = new Set<string>();
+        const requiredControls = calculateRequiredControls(
+            confidentialityScore, 
+            integrityScore, 
+            availabilityScore
+        );
 
-        // Rule 1: C > 4 (High or Critical)
-        if (cScore > 4) {
-            ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(c => requiredControls.add(c));
-        }
-
-        // Rule 2: Total > 12
-        if (totalScore > 12) {
-            Object.keys(CONTROL_CATALOG).forEach(c => requiredControls.add(c));
-        }
-
-        // Add missing controls
+        // Add missing required controls
         requiredControls.forEach(controlId => {
-            if (state.controls[controlId] === undefined) {
-                state.controls[controlId] = false;
+            if (storeState.controls[controlId] === undefined) {
+                storeState.controls[controlId] = false;
             }
         });
 
         // Remove controls no longer required
-        Object.keys(state.controls).forEach(controlId => {
+        Object.keys(storeState.controls).forEach(controlId => {
             if (!requiredControls.has(controlId)) {
-                delete state.controls[controlId];
+                delete storeState.controls[controlId];
             }
         });
-    }, [state.cia.confidentiality, state.cia.integrity, state.cia.availability]);
+    }, [
+        storeState.cia.confidentiality, 
+        storeState.cia.integrity, 
+        storeState.cia.availability
+    ]);
 
-    // Handler for CIA changes
-    const handleCiaChange = (field: keyof typeof state.cia, value: string) => {
-        state.cia[field] = value;
+    // ---- Event Handlers ----
+
+    /**
+     * Handles changes to CIA level dropdowns.
+     */
+    const handleCiaChange = (field: keyof typeof storeState.cia, value: string): void => {
+        storeState.cia[field] = value;
     };
 
-    const toggleControl = (controlId: string) => {
-        state.controls[controlId] = !state.controls[controlId];
+    /**
+     * Toggles a security control on or off.
+     */
+    const toggleControl = (controlId: string): void => {
+        storeState.controls[controlId] = !storeState.controls[controlId];
     };
+
+    // ---- Render ----
+
+    const statusText = getConnectionStatusText(isOnline, connectionStatus);
+    const statusIndicatorClass = getStatusIndicatorClass(isOnline, connectionStatus);
+    const statusTextClass = getStatusTextClass(isOnline, connectionStatus);
 
     return (
         <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
@@ -178,28 +333,21 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                 <div>
                     <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-1">Document Status</h2>
                     <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${!isOnline ? 'bg-amber-500' :
-                            connectionStatus === 'connected' ? 'bg-green-500' :
-                                connectionStatus === 'connecting' ? 'bg-yellow-500 animate-pulse' :
-                                    'bg-amber-500'
-                            }`}></span>
-                        <span className={`font-medium text-sm ${!isOnline ? 'text-amber-700' :
-                            connectionStatus === 'connected' ? 'text-green-700' :
-                                connectionStatus === 'connecting' ? 'text-yellow-700' :
-                                    'text-amber-700'
-                            }`}>
-                            {!isOnline ? 'Offline Mode' :
-                                connectionStatus === 'connected' ? 'Synchronized' :
-                                    connectionStatus === 'connecting' ? 'Connecting...' :
-                                        'Offline Mode'}
+                        <span className={`w-2 h-2 rounded-full ${statusIndicatorClass}`}></span>
+                        <span className={`font-medium text-sm ${statusTextClass}`}>
+                            {statusText}
                         </span>
                     </div>
                 </div>
 
                 <div className="flex -space-x-2">
-                    {users.map((u, i) => (
-                        <div key={i} className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600" title={u}>
-                            {u.charAt(0).toUpperCase()}
+                    {activeUsers.map((user, index) => (
+                        <div 
+                            key={index} 
+                            className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600" 
+                            title={user}
+                        >
+                            {user.charAt(0).toUpperCase()}
                         </div>
                     ))}
                 </div>
@@ -211,35 +359,34 @@ export default function RiskAssessmentEditor({ documentId, userName }: RiskAsses
                     <div key={metric} className="p-4 bg-gray-50 rounded-lg">
                         <label className="block text-xs font-bold text-gray-500 uppercase mb-2">{metric}</label>
                         <select
-                            value={state.cia[metric] || 'Low'}
+                            value={storeState.cia[metric] || DEFAULT_CIA_LEVEL}
                             onChange={(e) => handleCiaChange(metric, e.target.value)}
                             className="w-full bg-white border border-gray-200 text-gray-800 text-sm rounded-md p-2 focus:ring-2 focus:ring-blue-500 outline-none transition"
                         >
-                            <option value="Low">Low</option>
-                            <option value="Medium">Medium</option>
-                            <option value="High">High</option>
-                            <option value="Critical">Critical</option>
+                            {CIA_LEVELS.map(level => (
+                                <option key={level} value={level}>{level}</option>
+                            ))}
                         </select>
                     </div>
                 ))}
             </div>
 
             {/* Dynamic Controls */}
-            {Object.keys(state.controls).length > 0 && (
+            {Object.keys(storeState.controls).length > 0 && (
                 <div className="mb-8 p-6 bg-blue-50 rounded-lg border border-blue-100">
                     <h3 className="text-sm font-bold text-blue-800 uppercase tracking-wider mb-4">Required Security Controls</h3>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        {Object.keys(state.controls).map((controlId) => (
+                        {Object.keys(storeState.controls).map((controlId) => (
                             <div key={controlId} className="flex items-center gap-3 bg-white p-3 rounded border border-blue-200 shadow-sm">
                                 <input
                                     type="checkbox"
                                     id={controlId}
-                                    checked={state.controls[controlId]}
+                                    checked={storeState.controls[controlId]}
                                     onChange={() => toggleControl(controlId)}
                                     className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                                 />
                                 <label htmlFor={controlId} className="text-sm font-medium text-gray-700 cursor-pointer">
-                                    {CONTROL_CATALOG[controlId]}
+                                    {SECURITY_CONTROL_CATALOG[controlId]}
                                 </label>
                             </div>
                         ))}
