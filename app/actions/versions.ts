@@ -11,6 +11,7 @@
 
 import db from '@/lib/db';
 import * as Y from 'yjs';
+import { withDocumentMutex } from '@/persistence';
 
 // ---- Configuration ----
 
@@ -71,20 +72,25 @@ export async function createVersion(
             return { success: false, error: 'Document not found' };
         }
 
-        // Create the new version
-        const version = await db.documentVersion.create({
-            data: {
-                documentId,
-                snapshot: Buffer.from(snapshot),
-                label: label || null,
-                createdAt: BigInt(Date.now()),
-            },
+        // Wrap logic in document mutex to coordinate with auto-saves,
+        // and a transaction to ensure atomic DB updates.
+        return await withDocumentMutex(documentId, async () => {
+            return await db.$transaction(async (tx) => {
+                const version = await tx.documentVersion.create({
+                    data: {
+                        documentId,
+                        snapshot: Buffer.from(snapshot),
+                        label: label || null,
+                        createdAt: BigInt(Date.now()),
+                    },
+                });
+
+                // Enforce version limit - delete oldest versions if over limit
+                await enforceVersionLimit(documentId, tx);
+
+                return { success: true, data: { id: version.id } };
+            });
         });
-
-        // Enforce version limit - delete oldest versions if over limit
-        await enforceVersionLimit(documentId);
-
-        return { success: true, data: { id: version.id } };
     } catch (error) {
         console.error('Failed to create version:', error);
         return { success: false, error: 'Failed to create version' };
@@ -210,8 +216,8 @@ export async function getVersionCount(documentId: string): Promise<number> {
  * 
  * @param documentId - The document identifier
  */
-async function enforceVersionLimit(documentId: string): Promise<void> {
-    const count = await db.documentVersion.count({
+async function enforceVersionLimit(documentId: string, tx: any = db): Promise<void> {
+    const count = await tx.documentVersion.count({
         where: { documentId },
     });
 
@@ -220,7 +226,7 @@ async function enforceVersionLimit(documentId: string): Promise<void> {
     }
 
     // Find the oldest versions to delete
-    const versionsToDelete = await db.documentVersion.findMany({
+    const versionsToDelete = await tx.documentVersion.findMany({
         where: { documentId },
         orderBy: { createdAt: 'asc' },
         take: count - MAX_VERSIONS_PER_DOCUMENT,
@@ -228,9 +234,9 @@ async function enforceVersionLimit(documentId: string): Promise<void> {
     });
 
     // Delete the oldest versions
-    await db.documentVersion.deleteMany({
+    await tx.documentVersion.deleteMany({
         where: {
-            id: { in: versionsToDelete.map((v) => v.id) },
+            id: { in: versionsToDelete.map((v: { id: number }) => v.id) },
         },
     });
 

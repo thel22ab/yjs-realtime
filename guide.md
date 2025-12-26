@@ -863,7 +863,84 @@ export async function shutdown() {
 
 ---
 
+### Issue 8: Race Condition in Version Limit Enforcement
+
+**Problem**: Concurrent requests to create a version (e.g., multiple users clicking "Save" or auto-save firing near-simultaneously) could lead to exceeding the version limit (e.g., 50 versions).
+
+**Cause**: The logic was: 1) Create version, 2) Count total versions, 3) Delete oldest if over limit. Because these steps weren't synchronized, two concurrent requests could both see 50 versions, both create one (total 51), and then neither might delete the correct number, or they might interfere with each other.
+
+**Solution**: Implement a per-document **Mutex** to serialize all operations that modify document versions. We also wrapped the database operations in an interactive transaction.
+
+```typescript
+// persistence.ts
+export async function withDocumentMutex<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+    const meta = getOrCreateMeta(docId);
+    return await meta.mutex.runExclusive(fn);
+}
+
+// app/actions/versions.ts
+export async function createVersion(documentId: string, label: string) {
+    return await withDocumentMutex(documentId, async () => {
+        // Now atomic: create + count + prune
+        await prisma.$transaction(async (tx) => {
+            await tx.documentVersion.create({ ... });
+            await enforceVersionLimit(documentId, tx);
+        });
+    });
+}
+```
+
 ---
+
+### Issue 9: Concurrent Revert Operations & State Consistency
+
+**Problem**: Reverting a document involves resetting the entire state. If another update or revert happens at the same time, the document could end up in a corrupted or inconsistent state.
+
+**Cause**: Standard `Y.applyUpdate` merges state. To "revert", we actually need to clear the current state and re-insert the old state. Without a mutex, intermediate states are visible to other users.
+
+**Solution**: Use the document Mutex to block all other writes during a revert, and perform the restoration within a single `doc.transact()` block. Instead of applying a binary update, we explicitly clear the Map and Fragment types and re-populate them from a temporary document.
+
+```typescript
+// app/api/documents/[id]/versions/[versionId]/revert/route.ts
+await withDocumentMutex(documentId, async () => {
+    currentDoc.transact(() => {
+        // Use property-by-property restoration for reliability
+        currentCia.clear();
+        tempCia.forEach((v, k) => currentCia.set(k, v));
+        
+        // Clear and clone XML fragments for ProseMirror
+        while (currentProsemirror.length > 0) currentProsemirror.delete(0, 1);
+        tempProsemirror.forEach(child => currentProsemirror.insert(0, [child.clone()]));
+    }, 'revert');
+});
+```
+
+---
+
+### Issue 10: Compaction Race Condition
+
+**Problem**: The check for "has anything changed since last compaction?" was performed before acquiring the lock, leading to redundant database writes if two compaction triggers (timer and manual) fired at once.
+
+**Cause**: The `updatesSinceLastCompaction` check was outside the mutex block.
+
+**Solution**: Move the check inside the mutex and simplify the database logic into a single interactive transaction that handles the snapshot, cleaning up partial updates, and auto-versioning in one atomic unit.
+
+```typescript
+// persistence.ts
+await meta!.mutex.runExclusive(async () => {
+    // Check INSIDE the lock
+    if (meta && meta.updatesSinceLastCompaction === 0) return;
+
+    await prisma.$transaction(async (tx) => {
+        // 1. Save Snapshot
+        // 2. Delete Updates
+        // 3. Auto-versioning (if interval passed)
+    });
+});
+```
+
+---
+
 
 ## 8. Final Recommendations for Students
 

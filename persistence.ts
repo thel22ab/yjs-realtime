@@ -42,7 +42,7 @@ projectionManager.register(ciaProjection);
  * Metadata tracked for each active document.
  * Manages pending updates, timers, compaction state, and per-doc mutex.
  */
-interface DocumentMetadata {
+export interface DocumentMetadata {
     /** Array of pending updates waiting to be flushed to the database. */
     pendingUpdates: Uint8Array[];
 
@@ -288,12 +288,12 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
     // Ensure everything pending is written first
     await flushPendingUpdates(docId, doc);
 
-    if (meta && meta.updatesSinceLastCompaction === 0) {
-        return;
-    }
-
     // Serialize compaction under mutex
     await meta!.mutex.runExclusive(async () => {
+        if (meta && meta.updatesSinceLastCompaction === 0) {
+            return;
+        }
+
         const snapshot = Y.encodeStateAsUpdate(doc);
         const snapshotBuffer = Buffer.from(snapshot);
         const currentTimestamp = BigInt(Date.now());
@@ -301,56 +301,39 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
         try {
             console.log(`[Compaction] Executing transaction for ${docId}`);
 
-            // Transaction: Save Snapshot + Delete Updates
-            await prisma.$transaction([
-                prisma.documentSnapshot.upsert({
+            // Use a single interactive transaction for snapshot, cleanup, and versioning
+            await prisma.$transaction(async (tx) => {
+                await tx.documentSnapshot.upsert({
                     where: { documentId: docId },
-                    update: {
-                        snapshot: snapshotBuffer,
-                        updatedAt: currentTimestamp,
-                    },
-                    create: {
-                        documentId: docId,
-                        snapshot: snapshotBuffer,
-                        updatedAt: currentTimestamp,
-                    },
-                }),
-                prisma.documentUpdate.deleteMany({
-                    where: { documentId: docId },
-                }),
-            ]);
+                    update: { snapshot: snapshotBuffer, updatedAt: currentTimestamp },
+                    create: { documentId: docId, snapshot: snapshotBuffer, updatedAt: currentTimestamp },
+                });
 
-            // Run compact-triggered projections
+                await tx.documentUpdate.deleteMany({ where: { documentId: docId } });
+
+                // Auto-versioning: Create and prune versions atomically
+                const now = Date.now();
+                if (meta && now - meta.lastVersionCreatedAt >= AUTO_VERSION_INTERVAL_MS) {
+                    await tx.documentVersion.create({
+                        data: {
+                            documentId: docId,
+                            snapshot: snapshotBuffer,
+                            label: "Auto-save",
+                            createdAt: currentTimestamp,
+                        },
+                    });
+
+                    await enforceVersionLimit(docId, tx);
+                    meta.lastVersionCreatedAt = now;
+                    console.log(`[Versioning] Auto-created version for ${docId}`);
+                }
+            });
+
+            // Run projections outside DB transaction but inside mutex
             await runProjectionsInternal(docId, doc, "compact");
 
             if (meta) {
                 meta.updatesSinceLastCompaction = 0;
-            }
-
-            // Auto-versioning: Create a version snapshot periodically
-            if (meta) {
-                const now = Date.now();
-                const timeSinceLastVersion = now - meta.lastVersionCreatedAt;
-                
-                if (timeSinceLastVersion >= AUTO_VERSION_INTERVAL_MS) {
-                    try {
-                        await prisma.documentVersion.create({
-                            data: {
-                                documentId: docId,
-                                snapshot: snapshotBuffer,
-                                label: "Auto-save",
-                                createdAt: currentTimestamp,
-                            },
-                        });
-                        meta.lastVersionCreatedAt = now;
-                        console.log(`[Versioning] Auto-created version for ${docId}`);
-                        
-                        // Enforce version limit (keep max 50)
-                        await enforceVersionLimit(docId);
-                    } catch (versionError) {
-                        console.error(`[Versioning] Failed to create auto-version for ${docId}:`, versionError);
-                    }
-                }
             }
 
             console.log(`[Compaction] Success: ${docId}`);
@@ -365,10 +348,10 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
  * 
  * @param docId - The document identifier
  */
-async function enforceVersionLimit(docId: string): Promise<void> {
+async function enforceVersionLimit(docId: string, tx: any = prisma): Promise<void> {
     const MAX_VERSIONS = 50;
-    
-    const count = await prisma.documentVersion.count({
+
+    const count = await tx.documentVersion.count({
         where: { documentId: docId },
     });
 
@@ -376,18 +359,16 @@ async function enforceVersionLimit(docId: string): Promise<void> {
         return;
     }
 
-    // Find the oldest versions to delete
-    const versionsToDelete = await prisma.documentVersion.findMany({
+    const versionsToDelete = await tx.documentVersion.findMany({
         where: { documentId: docId },
         orderBy: { createdAt: 'asc' },
         take: count - MAX_VERSIONS,
         select: { id: true },
     });
 
-    // Delete the oldest versions
-    await prisma.documentVersion.deleteMany({
+    await tx.documentVersion.deleteMany({
         where: {
-            id: { in: versionsToDelete.map((v) => v.id) },
+            id: { in: versionsToDelete.map((v: any) => v.id) },
         },
     });
 
@@ -543,6 +524,18 @@ export async function shutdown(): Promise<void> {
     }
 
     await prisma.$disconnect();
+}
+
+/**
+ * Executes a function under the document's mutex to ensure serialization of DB writes.
+ * 
+ * @param docId - The unique identifier for the document
+ * @param fn - The function to execute under the mutex
+ * @returns The result of the function
+ */
+export async function withDocumentMutex<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+    const meta = getOrCreateMeta(docId);
+    return await meta.mutex.runExclusive(fn);
 }
 
 // Re-export projection manager for registration of additional projections

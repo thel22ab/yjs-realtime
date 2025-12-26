@@ -11,6 +11,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getVersion } from '@/app/actions/versions';
 import * as Y from 'yjs';
+import { getOrCreateMeta } from '@/persistence';
 
 interface RouteParams {
     params: Promise<{ id: string; versionId: string }>;
@@ -66,64 +67,41 @@ export async function POST(
             );
         }
 
-        // 3. Create a temporary doc and apply the version snapshot
-        // The version.snapshot is already a full document state (encodeStateAsUpdate)
-        const tempDoc = new Y.Doc();
-        Y.applyUpdate(tempDoc, version.snapshot);
+        // 3. Get the mutex for this document from persistence metadata
+        // to ensure we don't interleave with other writes or flushes
+        const meta = getOrCreateMeta(documentId, currentDoc);
 
-        // 4. Calculate the state we want to revert to
-        // We need to create an update that, when applied to currentDoc,
-        // will make it match tempDoc's state
+        await meta.mutex.runExclusive(async () => {
+            // 4. Create a temporary doc and apply the version snapshot
+            const tempDoc = new Y.Doc();
+            Y.applyUpdate(tempDoc, version.snapshot);
 
-        // Strategy: Clear relevant shared types and rebuild from version
-        // For this app, we have: cia (Y.Map), controls (Y.Map), prosemirror (Y.XmlFragment)
+            // 5. Apply changes as a single transaction
+            currentDoc.transact(() => {
+                const currentCia = currentDoc.getMap('cia');
+                const tempCia = tempDoc.getMap('cia');
+                const currentControls = currentDoc.getMap('controls');
+                const tempControls = tempDoc.getMap('controls');
+                const currentProsemirror = currentDoc.getXmlFragment('prosemirror');
+                const tempProsemirror = tempDoc.getXmlFragment('prosemirror');
 
-        currentDoc.transact(() => {
-            // Get shared types from both docs
-            const currentCia = currentDoc.getMap('cia');
-            const tempCia = tempDoc.getMap('cia');
+                // Restore maps
+                currentCia.forEach((_, k) => currentCia.delete(k));
+                tempCia.forEach((v, k) => currentCia.set(k, v));
 
-            const currentControls = currentDoc.getMap('controls');
-            const tempControls = tempDoc.getMap('controls');
+                currentControls.forEach((_, k) => currentControls.delete(k));
+                tempControls.forEach((v, k) => currentControls.set(k, v));
 
-            const currentProsemirror = currentDoc.getXmlFragment('prosemirror');
-            const tempProsemirror = tempDoc.getXmlFragment('prosemirror');
-
-            // Clear and restore CIA map
-            currentCia.forEach((_value, key) => {
-                currentCia.delete(key);
-            });
-            tempCia.forEach((value, key) => {
-                currentCia.set(key, value);
-            });
-
-            // Clear and restore controls map
-            currentControls.forEach((_value, key) => {
-                currentControls.delete(key);
-            });
-            tempControls.forEach((value, key) => {
-                currentControls.set(key, value);
-            });
-
-            // Clear and restore ProseMirror content
-            // Delete all children from current
-            while (currentProsemirror.length > 0) {
-                currentProsemirror.delete(0, 1);
-            }
-
-            // Clone children from temp to current
-            // Note: XmlFragment children are XmlElement or XmlText
-            for (let i = 0; i < tempProsemirror.length; i++) {
-                const child = tempProsemirror.get(i);
-                if (child) {
-                    // Clone the child - we need to create a deep copy
-                    currentProsemirror.insert(i, [child.clone()]);
+                // Restore ProseMirror
+                while (currentProsemirror.length > 0) currentProsemirror.delete(0, 1);
+                for (let i = 0; i < tempProsemirror.length; i++) {
+                    const child = tempProsemirror.get(i);
+                    if (child) currentProsemirror.insert(i, [child.clone()]);
                 }
-            }
-        }, 'revert');
+            }, 'revert');
 
-        // 5. Clean up temp doc
-        tempDoc.destroy();
+            tempDoc.destroy();
+        });
 
         console.log(`[Revert] Document ${documentId} reverted to version ${versionId}`);
 
