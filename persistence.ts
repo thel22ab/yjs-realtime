@@ -6,13 +6,16 @@
  * - Document metadata tracking with pending updates
  * - Debounced flush operations for batched writes
  * - Periodic compaction to optimize storage
- * - CIA (Confidentiality, Integrity, Availability) synchronization
+ * - Projection plugin system for syncing Yjs state to relational tables
  * 
  * @module persistence
  */
 
 import * as Y from "yjs";
+import { Mutex } from "async-mutex";
 import prisma from "./lib/db";
+import { projectionManager, ciaProjection } from "./persistence/projections";
+import type { ProjectionTrigger } from "./persistence/projections";
 
 // ---- Configuration Constants ----
 
@@ -22,54 +25,24 @@ const DEBOUNCE_DELAY_MS = 50;
 /** Interval in milliseconds for periodic compaction (10 seconds for testing, normally 60000). */
 const COMPACTION_INTERVAL_MS = 10_000;
 
+/** Interval in milliseconds for automatic version creation (60 seconds). */
+const AUTO_VERSION_INTERVAL_MS = 60_000;
+
 /** Origin identifier for updates applied from persistence layer. */
 export const YJS_ORIGIN_PERSISTENCE = "persistence";
 
-// ---- CIA Level Mappings ----
+// ---- Register Projections ----
 
-/**
- * CIA level string values from the Yjs document.
- */
-type CiaLevelValue = string | undefined;
-
-/**
- * CIA level enumeration for internal calculations.
- */
-enum CiaLevel {
-    NotSet = 0,
-    Low = 1,
-    Medium = 2,
-    High = 3,
-}
-
-/**
- * Maps a CIA string value to its numeric level.
- * 
- * @param value - The CIA level string ('Low', 'Medium', 'High', 'Critical')
- * @returns The numeric level (0-3), where 0 means not set
- */
-function parseCiaLevel(value: CiaLevelValue): CiaLevel {
-    switch (value) {
-        case 'Low':
-            return CiaLevel.Low;
-        case 'Medium':
-            return CiaLevel.Medium;
-        case 'High':
-            return CiaLevel.High;
-        case 'Critical':
-            return CiaLevel.High; // Map Critical to High (3)
-        default:
-            return CiaLevel.NotSet;
-    }
-}
+// Register CIA projection on module load
+projectionManager.register(ciaProjection);
 
 // ---- In-memory Document Metadata ----
 
 /**
  * Metadata tracked for each active document.
- * Manages pending updates, timers, and compaction state.
+ * Manages pending updates, timers, compaction state, and per-doc mutex.
  */
-interface DocumentMetadata {
+export interface DocumentMetadata {
     /** Array of pending updates waiting to be flushed to the database. */
     pendingUpdates: Uint8Array[];
 
@@ -82,8 +55,17 @@ interface DocumentMetadata {
     /** Number of update rows written since the last compaction. */
     updatesSinceLastCompaction: number;
 
-    /** Reference to the Yjs document for CIA synchronization. */
+    /** Reference to the Yjs document for operations. */
     yjsDocument?: Y.Doc;
+
+    /** Per-document mutex for serializing all DB writes. */
+    mutex: Mutex;
+
+    /** Whether persistence listener has been attached. */
+    listenerAttached: boolean;
+
+    /** Timestamp of last version creation. */
+    lastVersionCreatedAt: number;
 }
 
 /** Map of document IDs to their metadata. */
@@ -105,6 +87,9 @@ export function getOrCreateMeta(docId: string, yjsDoc?: Y.Doc): DocumentMetadata
             compactionTimer: null,
             updatesSinceLastCompaction: 0,
             yjsDocument: yjsDoc,
+            mutex: new Mutex(),
+            listenerAttached: false,
+            lastVersionCreatedAt: 0,
         };
         documentMetadataMap.set(docId, meta);
     } else if (yjsDoc) {
@@ -122,7 +107,7 @@ export function getOrCreateMeta(docId: string, yjsDoc?: Y.Doc): DocumentMetadata
  * @param meta - The document metadata containing pending updates
  * @returns The merged update blob, or null if no updates are pending
  */
-async function mergePendingUpdates(meta: DocumentMetadata): Promise<Uint8Array | null> {
+function mergePendingUpdates(meta: DocumentMetadata): Uint8Array | null {
     if (meta.pendingUpdates.length === 0) {
         return null;
     }
@@ -147,37 +132,6 @@ async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array): Pro
 }
 
 /**
- * Synchronizes CIA (Confidentiality, Integrity, Availability) values
- * from the Yjs document to the database.
- * 
- * @param docId - The document identifier
- * @param doc - The Yjs document containing CIA values
- * @returns A promise that resolves when CIA values are synchronized
- */
-async function syncDocumentCIAValues(docId: string, doc: Y.Doc): Promise<void> {
-    const ciaMap = doc.getMap('cia');
-    const rawCia = ciaMap.toJSON();
-
-    const confidentiality = parseCiaLevel(rawCia.confidentiality);
-    const integrity = parseCiaLevel(rawCia.integrity);
-    const availability = parseCiaLevel(rawCia.availability);
-
-    try {
-        await prisma.document.update({
-            where: { id: docId },
-            data: {
-                confidentiality,
-                integrity,
-                availability,
-            },
-        });
-        console.log(`[CIA Sync] Updated ${docId}: C=${confidentiality} I=${integrity} A=${availability}`);
-    } catch (error) {
-        console.error(`[CIA Sync] Failed for ${docId}:`, error);
-    }
-}
-
-/**
  * Logs an error with consistent formatting for persistence operations.
  * 
  * @param operation - The name of the operation that failed
@@ -191,8 +145,20 @@ function logPersistenceError(operation: string, docId: string, error: unknown): 
 // ---- Core Persistence Operations ----
 
 /**
+ * Runs projections for a given trigger.
+ * Internal helper - must be called under mutex.
+ */
+async function runProjectionsInternal(
+    docId: string,
+    doc: Y.Doc,
+    trigger: ProjectionTrigger
+): Promise<void> {
+    await projectionManager.runProjections(docId, doc, trigger, prisma);
+}
+
+/**
  * Flushes all pending updates for a document to the database.
- * This includes merging updates, persisting them, and syncing CIA values.
+ * This includes merging updates, persisting them, and running flush-triggered projections.
  * 
  * @param docId - The document identifier
  * @param doc - The Yjs document containing updates
@@ -201,35 +167,44 @@ function logPersistenceError(operation: string, docId: string, error: unknown): 
 async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
     const meta = documentMetadataMap.get(docId);
 
-    if (!meta || meta.pendingUpdates.length === 0) {
-        // Even if no pending binary updates, sync CIA values if we have the document
-        if (doc) {
-            await syncDocumentCIAValues(docId, doc);
+    if (!meta) {
+        return;
+    }
+
+    // Serialize all DB work under mutex
+    await meta.mutex.runExclusive(async () => {
+        if (meta.pendingUpdates.length === 0) {
+            // Even if no pending binary updates, run projections if we have the document
+            if (doc) {
+                await runProjectionsInternal(docId, doc, "flush");
+            }
+            return;
         }
-        return;
-    }
 
-    console.log(`[Flush] Flushing ${meta.pendingUpdates.length} updates for ${docId}`);
+        console.log(`[Flush] Flushing ${meta.pendingUpdates.length} updates for ${docId}`);
 
-    // Merge pending updates into a single blob
-    const merged = await mergePendingUpdates(meta);
+        // Merge pending updates into a single blob
+        const merged = mergePendingUpdates(meta);
 
-    if (merged === null) {
-        return;
-    }
+        if (merged === null) {
+            return;
+        }
 
-    try {
-        await persistMergedUpdate(docId, merged);
-        // Only clear pending after successful write to prevent data loss
-        meta.pendingUpdates = [];
-        meta.updatesSinceLastCompaction += 1;
-        console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
+        try {
+            await persistMergedUpdate(docId, merged);
+            // Only clear pending after successful write to prevent data loss
+            meta.pendingUpdates = [];
+            meta.updatesSinceLastCompaction += 1;
+            console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
 
-        // Also update CIA values in the sidecar document table
-        await syncDocumentCIAValues(docId, doc!);
-    } catch (error) {
-        logPersistenceError('Flush', docId, error);
-    }
+            // Run flush-triggered projections
+            if (doc) {
+                await runProjectionsInternal(docId, doc, "flush");
+            }
+        } catch (error) {
+            logPersistenceError('Flush', docId, error);
+        }
+    });
 }
 
 /**
@@ -240,15 +215,6 @@ async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
  * 
  * @param docId - The unique identifier for the document
  * @param doc - The Yjs document containing updates to flush
- * 
- * @example
- * ```typescript
- * doc.on('update', (update) => {
- *     const meta = getOrCreateMeta(docId, doc);
- *     meta.pendingUpdates.push(update);
- *     scheduleFlush(docId, doc);
- * });
- * ```
  */
 export function scheduleFlush(docId: string, doc: Y.Doc): void {
     const meta = getOrCreateMeta(docId, doc);
@@ -302,12 +268,16 @@ export function stopCompactionTimer(docId: string): void {
         meta.flushTimer = null;
     }
 
+    // Clean up projection manager resources
+    projectionManager.cleanup(docId);
+
     // Clean up metadata
     documentMetadataMap.delete(docId);
 }
 
 /**
  * Compacts a document by creating a snapshot and clearing incremental updates.
+ * Also creates automatic version snapshots periodically.
  * 
  * @param docId - The document identifier
  * @param doc - The Yjs document to compact
@@ -318,50 +288,129 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
     // Ensure everything pending is written first
     await flushPendingUpdates(docId, doc);
 
-    if (meta && meta.updatesSinceLastCompaction === 0) {
+    // Serialize compaction under mutex
+    await meta!.mutex.runExclusive(async () => {
+        if (meta && meta.updatesSinceLastCompaction === 0) {
+            return;
+        }
+
+        const snapshot = Y.encodeStateAsUpdate(doc);
+        const snapshotBuffer = Buffer.from(snapshot);
+        const currentTimestamp = BigInt(Date.now());
+
+        try {
+            console.log(`[Compaction] Executing transaction for ${docId}`);
+
+            // Use a single interactive transaction for snapshot, cleanup, and versioning
+            await prisma.$transaction(async (tx) => {
+                await tx.documentSnapshot.upsert({
+                    where: { documentId: docId },
+                    update: { snapshot: snapshotBuffer, updatedAt: currentTimestamp },
+                    create: { documentId: docId, snapshot: snapshotBuffer, updatedAt: currentTimestamp },
+                });
+
+                await tx.documentUpdate.deleteMany({ where: { documentId: docId } });
+
+                // Auto-versioning: Create and prune versions atomically
+                const now = Date.now();
+                if (meta && now - meta.lastVersionCreatedAt >= AUTO_VERSION_INTERVAL_MS) {
+                    await tx.documentVersion.create({
+                        data: {
+                            documentId: docId,
+                            snapshot: snapshotBuffer,
+                            label: "Auto-save",
+                            createdAt: currentTimestamp,
+                        },
+                    });
+
+                    await enforceVersionLimit(docId, tx);
+                    meta.lastVersionCreatedAt = now;
+                    console.log(`[Versioning] Auto-created version for ${docId}`);
+                }
+            });
+
+            // Run projections outside DB transaction but inside mutex
+            await runProjectionsInternal(docId, doc, "compact");
+
+            if (meta) {
+                meta.updatesSinceLastCompaction = 0;
+            }
+
+            console.log(`[Compaction] Success: ${docId}`);
+        } catch (error) {
+            logPersistenceError('Compaction', docId, error);
+        }
+    });
+}
+
+/**
+ * Enforces the maximum version limit by deleting the oldest versions.
+ * 
+ * @param docId - The document identifier
+ */
+async function enforceVersionLimit(docId: string, tx: any = prisma): Promise<void> {
+    const MAX_VERSIONS = 50;
+
+    const count = await tx.documentVersion.count({
+        where: { documentId: docId },
+    });
+
+    if (count <= MAX_VERSIONS) {
         return;
     }
 
-    const snapshot = Y.encodeStateAsUpdate(doc);
-    const snapshotBuffer = Buffer.from(snapshot);
-    const currentTimestamp = BigInt(Date.now());
+    const versionsToDelete = await tx.documentVersion.findMany({
+        where: { documentId: docId },
+        orderBy: { createdAt: 'asc' },
+        take: count - MAX_VERSIONS,
+        select: { id: true },
+    });
 
-    try {
-        console.log(`[Compaction] Executing transaction for ${docId}`);
+    await tx.documentVersion.deleteMany({
+        where: {
+            id: { in: versionsToDelete.map((v: any) => v.id) },
+        },
+    });
 
-        // Transaction: Save Snapshot + Delete Updates
-        await prisma.$transaction([
-            prisma.documentSnapshot.upsert({
-                where: { documentId: docId },
-                update: {
-                    snapshot: snapshotBuffer,
-                    updatedAt: currentTimestamp,
-                },
-                create: {
-                    documentId: docId,
-                    snapshot: snapshotBuffer,
-                    updatedAt: currentTimestamp,
-                },
-            }),
-            prisma.documentUpdate.deleteMany({
-                where: { documentId: docId },
-            }),
-        ]);
-
-        // Also update CIA values to ensure they are in sync
-        await syncDocumentCIAValues(docId, doc);
-
-        if (meta) {
-            meta.updatesSinceLastCompaction = 0;
-        }
-
-        console.log(`[Compaction] Success: ${docId}`);
-    } catch (error) {
-        logPersistenceError('Compaction', docId, error);
-    }
+    console.log(`[Versioning] Pruned ${versionsToDelete.length} old versions for ${docId}`);
 }
 
+
 // ---- Public API ----
+
+/**
+ * Attaches the persistence layer to a Yjs document.
+ * This is the centralized place where the update listener is bound.
+ * 
+ * @param docId - The document identifier
+ * @param doc - The Yjs document to attach persistence to
+ */
+export function attachDocument(docId: string, doc: Y.Doc): void {
+    const meta = getOrCreateMeta(docId, doc);
+
+    // Prevent duplicate listener attachment
+    if (meta.listenerAttached) {
+        console.log(`[Persistence] Listener already attached for ${docId}, skipping`);
+        return;
+    }
+
+    meta.listenerAttached = true;
+    console.log(`[Persistence] Attaching update listener for ${docId}`);
+
+    // Single update listener for this document
+    doc.on("update", (update: Uint8Array, origin: unknown) => {
+        if (origin === YJS_ORIGIN_PERSISTENCE) return;
+
+        console.log(`[Update] Captured for ${docId}, size: ${update.byteLength}`);
+
+        meta.pendingUpdates.push(update);
+        projectionManager.markAllDirty(docId);
+        scheduleFlush(docId, doc);
+    });
+
+    // Bind projection observers
+    projectionManager.bindDocument(docId, doc);
+}
 
 /**
  * Saves and compacts a document.
@@ -373,7 +422,7 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
 export async function saveAndCompact(docId: string, doc: Y.Doc): Promise<void> {
     console.log(`[SaveAndCompact] Saving document on close: ${docId}`);
 
-    // Flush any pending updates and update CIA values
+    // Flush any pending updates
     await flushPendingUpdates(docId, doc);
 
     // Force compaction regardless of updateRowsSinceCompact
@@ -383,6 +432,12 @@ export async function saveAndCompact(docId: string, doc: Y.Doc): Promise<void> {
         const hadUpdates = meta.updatesSinceLastCompaction;
         meta.updatesSinceLastCompaction = 1;
         await compactDocument(docId, doc);
+
+        // Run close-triggered projections
+        await meta.mutex.runExclusive(async () => {
+            await runProjectionsInternal(docId, doc, "close");
+        });
+
         if (hadUpdates === 0) {
             // Log that we saved even if no new updates
             console.log(`[SaveAndCompact] Document ${docId} saved (no pending updates)`);
@@ -451,7 +506,7 @@ export async function shutdown(): Promise<void> {
     // Flush any pending buffered updates
     const flushPromises: Promise<void>[] = [];
     for (const [docId, meta] of documentMetadataMap) {
-        // Pass the tracked document object to ensure CIA values are synced
+        // Pass the tracked document object to ensure projections run
         if (meta.yjsDocument) {
             flushPromises.push(flushPendingUpdates(docId, meta.yjsDocument));
         }
@@ -470,3 +525,18 @@ export async function shutdown(): Promise<void> {
 
     await prisma.$disconnect();
 }
+
+/**
+ * Executes a function under the document's mutex to ensure serialization of DB writes.
+ * 
+ * @param docId - The unique identifier for the document
+ * @param fn - The function to execute under the mutex
+ * @returns The result of the function
+ */
+export async function withDocumentMutex<T>(docId: string, fn: () => Promise<T>): Promise<T> {
+    const meta = getOrCreateMeta(docId);
+    return await meta.mutex.runExclusive(fn);
+}
+
+// Re-export projection manager for registration of additional projections
+export { projectionManager };

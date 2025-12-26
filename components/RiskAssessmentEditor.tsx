@@ -23,6 +23,7 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
 import { useSyncedStore } from '@syncedstore/react';
 import { createStore, getYjsDoc } from '@/lib/store';
+import VersionHistoryDropdown from './VersionHistoryDropdown';
 
 // ---- Types ----
 
@@ -32,7 +33,7 @@ import { createStore, getYjsDoc } from '@/lib/store';
 interface RiskAssessmentEditorProps {
     /** Unique identifier for the document being edited. */
     documentId: string;
-    
+
     /** Name of the user for presence/awareness display. */
     userName: string;
 }
@@ -41,7 +42,7 @@ interface RiskAssessmentEditorProps {
 
 /** Available user cursor colors for collaborative editing. */
 const CURSOR_COLORS = [
-    '#f87171', '#fb923c', '#fbbf24', '#a3e635', 
+    '#f87171', '#fb923c', '#fbbf24', '#a3e635',
     '#34d399', '#22d3ee', '#818cf8', '#c084fc'
 ];
 
@@ -121,14 +122,14 @@ function calculateRequiredControls(
 
     // Rule 1: High confidentiality (> 4) requires encryption and access controls
     if (confidentialityScore > 4) {
-        ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(control => 
+        ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(control =>
             requiredControls.add(control)
         );
     }
 
     // Rule 2: High total risk (> 12) requires all controls
     if (totalScore > 12) {
-        Object.keys(SECURITY_CONTROL_CATALOG).forEach(control => 
+        Object.keys(SECURITY_CONTROL_CATALOG).forEach(control =>
             requiredControls.add(control)
         );
     }
@@ -147,7 +148,7 @@ function getRandomCursorColor(): string {
  * Determines connection status display text based on state.
  */
 function getConnectionStatusText(
-    isOnline: boolean, 
+    isOnline: boolean,
     connectionStatus: 'connecting' | 'connected' | 'disconnected'
 ): string {
     if (!isOnline) return 'Offline Mode';
@@ -184,13 +185,13 @@ function getStatusTextClass(
 
 // ---- Component ----
 
-export default function RiskAssessmentEditor({ 
-    documentId, 
-    userName 
+export default function RiskAssessmentEditor({
+    documentId,
+    userName
 }: RiskAssessmentEditorProps) {
     const editorRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
-    
+
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const [activeUsers, setActiveUsers] = useState<string[]>([]);
@@ -280,8 +281,8 @@ export default function RiskAssessmentEditor({
         const availabilityScore = calculateCiaWeight(storeState.cia.availability ?? DEFAULT_CIA_LEVEL);
 
         const requiredControls = calculateRequiredControls(
-            confidentialityScore, 
-            integrityScore, 
+            confidentialityScore,
+            integrityScore,
             availabilityScore
         );
 
@@ -299,8 +300,8 @@ export default function RiskAssessmentEditor({
             }
         });
     }, [
-        storeState.cia.confidentiality, 
-        storeState.cia.integrity, 
+        storeState.cia.confidentiality,
+        storeState.cia.integrity,
         storeState.cia.availability
     ]);
 
@@ -340,16 +341,22 @@ export default function RiskAssessmentEditor({
                     </div>
                 </div>
 
-                <div className="flex -space-x-2">
-                    {activeUsers.map((user, index) => (
-                        <div 
-                            key={index} 
-                            className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600" 
-                            title={user}
-                        >
-                            {user.charAt(0).toUpperCase()}
-                        </div>
-                    ))}
+                <div className="flex items-center gap-4">
+                    {/* Version History Dropdown */}
+                    <VersionHistoryDropdown documentId={documentId} />
+
+                    {/* Active Users */}
+                    <div className="flex -space-x-2">
+                        {activeUsers.map((user, index) => (
+                            <div
+                                key={index}
+                                className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600"
+                                title={user}
+                            >
+                                {user.charAt(0).toUpperCase()}
+                            </div>
+                        ))}
+                    </div>
                 </div>
             </div>
 
