@@ -17,6 +17,7 @@ model Document {
 
     snapshot DocumentSnapshot?
     updates  DocumentUpdate[]
+    versions DocumentVersion[]
 
     @@map("documents")
 }
@@ -39,4 +40,28 @@ model DocumentUpdate {
 
     @@index([documentId, id])
     @@map("document_updates")
+}
+
+model DocumentVersion {
+    id         Int      @id @default(autoincrement())
+    documentId String   @map("document_id")
+    document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+    snapshot   Bytes // Encoded Yjs snapshot
+    label      String? // Optional user-provided label
+    createdAt  BigInt   @map("created_at")
+
+    @@index([documentId, createdAt(sort: Desc)])
+    @@map("document_versions")
+}
+
+model ProjectionState {
+    docId          String
+    name           String
+    version        Int
+    lastAppliedRev BigInt  @map("last_applied_rev")
+    lastAppliedAt  BigInt  @map("last_applied_at")
+    lastError      String? @map("last_error")
+
+    @@id([docId, name])
+    @@map("projection_state")
 }

@@ -125,17 +125,9 @@ app.prepare().then(() => {
 
                 // Mark as attached BEFORE attaching listener to prevent duplicates
                 markPersistenceAttached(doc, persistenceKey);
-                console.log(`[bindState] Attaching update listener for: ${docName}`);
 
-                doc.on("update", (update: Uint8Array, origin: unknown) => {
-                    if (origin === persistence.YJS_ORIGIN_PERSISTENCE) return;
-
-                    console.log(`[Update] Captured for ${docName}, size: ${update.byteLength}`);
-
-                    const meta = persistence.getOrCreateMeta(docName, doc);
-                    meta.pendingUpdates.push(update);
-                    persistence.scheduleFlush(docName, doc);
-                });
+                // Use centralized attachDocument for update listener + projections
+                persistence.attachDocument(docName, doc);
 
                 // Load persisted state from SQLite
                 console.log(`[bindState] Loading persisted state for: ${docName}`);
