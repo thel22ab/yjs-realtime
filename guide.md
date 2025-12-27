@@ -25,11 +25,11 @@ To achieve real-time collaboration with persistence, we chose a **Hybrid Archite
 
 | Component | Technology | Purpose |
 |-----------|------------|---------|
-| **Framework** | Next.js 15/16 (App Router) | Frontend UI and API routes |
+| **Framework** | Next.js 16 (App Router) | Frontend UI and API routes |
 | **Real-Time Engine** | Yjs (CRDT library) | Conflict-free data merging |
 | **Transport** | WebSockets | Instant updates between clients |
-| **Persistence** | SQLite (via `better-sqlite3`) | Durable document state |
-| **Server** | Custom Node.js Server | Unified hosting for Next.js + WebSockets |
+| **Persistence** | SQLite (via Prisma) | Durable document state |
+| **Server** | Custom Node.js Server (TypeScript) | Unified hosting for Next.js + WebSockets |
 
 ### Why This Stack?
 
@@ -41,119 +41,149 @@ Standard Next.js Server Actions are great for request/response flows, but real-t
 
 ### Step 1: Project Setup & Custom Server
 
-We started by installing the core dependencies:
+We started by installing the core dependencies.
 
 ```bash
-npm install yjs y-websocket @y/websocket-server better-sqlite3 ws
+npm install yjs y-websocket @y/websocket-server ws prisma @prisma/client synced-store
 ```
 
-The critical piece was `server.js`. This file replaces the standard `next start` command. It initializes Next.js but also listens for WebSocket upgrades.
+The critical piece was `server.ts`. This file replaces the standard `next start` command. It initializes Next.js but also listens for WebSocket upgrades.
 
-**Key Code: Custom Server**
+**Key Code: Custom Server (server.ts)**
 
-```javascript
-// server.js
-const { createServer } = require('http');
-const { WebSocketServer } = require('ws');
-const { setupWSConnection } = require('@y/websocket-server/utils');
-// ... Next.js setup ...
+```typescript
+// server.ts
+import { createServer } from "http";
+import next from "next";
+import { WebSocketServer } from "ws";
+import { setupWSConnection, setPersistence } from "@y/websocket-server/utils";
+import * as persistence from "./persistence";
+
+const app = next({ dev: process.env.NODE_ENV !== "production" });
+const handle = app.getRequestHandler();
 
 app.prepare().then(() => {
-  const server = createServer((req, res) => {
+    const server = createServer((req, res) => {
     // Handle Next.js requests
-    handle(req, res);
-  });
+        handle(req, res);
+    });
 
   // Attach WebSocket Server
-  const wss = new WebSocketServer({ noServer: true });
+    const wss = new WebSocketServer({ noServer: true });
 
-  server.on('upgrade', (request, socket, head) => {
-    // Handle WebSocket upgrades
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
+    // Set up global persistence BEFORE connections
+    setPersistence({
+        bindState: async (docName, doc) => {
+            await persistence.loadDocFromDb(docName, doc);
+            persistence.startCompactionTimer(docName, doc);
+        },
+        writeState: async (docName, doc) => {
+            await persistence.saveAndCompact(docName, doc);
+            persistence.stopCompactionTimer(docName);
+        }
     });
-  });
+
+    server.on("upgrade", (req, socket, head) => {
+        if (req.url?.startsWith("/yjs/")) {
+            wss.handleUpgrade(req, socket, head, (ws) => {
+                wss.emit("connection", ws, req);
+            });
+        }
+    });
 
   // Wiring up Yjs
   wss.on('connection', (ws, req) => {
     setupWSConnection(ws, req, { gc: true });
-  });
+    });
 
-  server.listen(3000);
+    server.listen(3000);
 });
 ```
 
 ---
 
-### Step 2: Database Layer (SQLite)
+### Step 2: Database Layer (SQLite via Prisma)
 
-We chose SQLite for its simplicity and file-based nature. We used `better-sqlite3` and enabled **WAL (Write-Ahead Logging)** mode for better concurrency support, which is essential when WebSockets might be writing while Server Actions are reading.
+Instead of manual SQL queries, we chose **Prisma** with SQLite. This provides type-safe access and a clear schema for our "Snapshot + Updates" persistence strategy. We enable **WAL (Write-Ahead Logging)** mode in SQLite for better concurrency.
 
-**Key Code: Persistence**
+**The Workflow:**
+1. **Snapshots**: Store the full state of a Y.Doc periodically (Compaction).
+2. **Updates**: Store individual incremental updates between snapshots (Journaling).
+3. **Load**: On server start, apply the latest snapshot and then all subsequent updates.
 
-```javascript
-// Inside server.js setupWSConnection callback
-setupWSConnection(ws, req, {
-  bindState: async (doc) => {
-    // 1. Load initial state from DB
-    const row = db.prepare('SELECT state_vector FROM ...').get(docName);
-    if (row) Y.applyUpdate(doc, row.state_vector);
+**Key Code: Persistence Logic**
 
-    // 2. Listen for updates and save
-    doc.on('update', () => {
-      const update = Y.encodeStateAsUpdate(doc);
-      db.prepare('INSERT OR REPLACE ...').run(docName, update);
-    });
-  }
-});
+```typescript
+// persistence.ts (simplified)
+export async function loadDocFromDb(docId: string, doc: Y.Doc) {
+    // 1. Load latest full snapshot
+    const snapshot = await prisma.documentSnapshot.findUnique({ where: { docId } });
+    if (snapshot) Y.applyUpdate(doc, snapshot.data);
+
+    // 2. Apply all incremental updates since that snapshot
+    const updates = await prisma.documentUpdate.findMany({ where: { docId } });
+    updates.forEach(u => Y.applyUpdate(doc, u.data));
+}
+
+export function scheduleFlush(docId: string, update: Uint8Array) {
+    // Debounce and batch writes to prevent DB bottleneck
+    // (See Section 5 for full implementation)
+}
 ```
 
 ---
 
 ### Step 3: The Frontend Editor
 
-We built a custom form editor combining **Yjs primitives** with **ProseMirror**:
+We built a custom form editor combining **SyncedStore** for reactive UI state and **ProseMirror** for collaborative rich text:
 
-- **`Y.Map`** for the CIA dropdowns (Confidentiality, Integrity, Availability)
-- **`Y.XmlFragment`** with **ProseMirror** for the Notes field
+- **SyncedStore** manages the CIA dropdowns and security controls using a reactive proxy.
+- **ProseMirror** handles the Assessment Notes via the `y-prosemirror` binding.
 
-#### Why ProseMirror Even for a Simple Notes Field?
+#### Why SyncedStore?
 
-Initially, we tried using a plain `<textarea>` with `Y.Text`. The problem? Standard textareas don't provide character-level change events — only the full value after each keystroke. This forced us to "delete all and re-insert" on every change:
+While raw Yjs `Y.Map` and `Y.Text` are powerful, they require manual observation to keep React state in sync. **SyncedStore** provides a reactive proxy API: Any change to the store automatically triggers a React re-render, and any remote change from a peer is instantly reflected in the UI.
 
 ```typescript
-// ❌ BAD: Naive textarea approach (defeats CRDT purpose)
-ydoc.transact(() => {
-  notesText.delete(0, notesText.length);
-  notesText.insert(0, newValue);
+// lib/store.ts
+import { syncedStore } from "@syncedstore/core";
+
+export const createStore = () => syncedStore({
+    cia: {},            // Becomes a Y.Map
+    controls: {},       // Becomes a Y.Map
+    prosemirror: "xml", // Becomes a Y.XmlFragment
 });
 ```
 
-This effectively becomes **Last Write Wins** for the entire text block, losing the character-level merging that makes CRDTs valuable.
+#### Integrating ProseMirror with SyncedStore
 
-**ProseMirror solves this** by providing granular transaction-level changes that map perfectly to Yjs operations. The `y-prosemirror` binding handles this automatically:
+ProseMirror needs character-level change events, which standard textareas don't provide. We use `y-prosemirror` to bind a ProseMirror editor to the `Y.XmlFragment` stored inside our SyncedStore:
 
 ```typescript
-import { ySyncPlugin, yCursorPlugin, yUndoPlugin } from 'y-prosemirror';
-import { exampleSetup } from 'prosemirror-example-setup';
+// RiskAssessmentEditor.tsx
+const docStore = useMemo(() => createStore(), []);
+const state = useSyncedStore(docStore);
 
-// Y.XmlFragment instead of Y.Text for ProseMirror
-const yXmlFragment = ydoc.getXmlFragment('prosemirror');
+useEffect(() => {
+    // 1. Get raw Y.Doc from SyncedStore
+    const ydoc = getYjsDoc(docStore);
+    const yXmlFragment = ydoc.getXmlFragment('prosemirror');
 
-const state = EditorState.create({
-  schema,
-  plugins: [
-    ySyncPlugin(yXmlFragment),      // Syncs ProseMirror ↔ Yjs
-    yCursorPlugin(awareness),        // Shows remote cursors
-    yUndoPlugin(),                   // Undo YOUR changes only
-    ...exampleSetup({ schema })
-  ]
-});
-
-const view = new EditorView(editorRef.current, { state });
+    // 2. Bind ProseMirror to it
+    const editorState = EditorState.create({
+        schema,
+        plugins: [
+            ySyncPlugin(yXmlFragment),
+            yCursorPlugin(awareness),
+            yUndoPlugin(),
+            ...exampleSetup({ schema })
+        ]
+    });
+    new EditorView(editorRef.current, { state: editorState });
+}, []);
 ```
 
-#### Benefits of ProseMirror + y-prosemirror
+#### Benefits of This Combined Approach
 
 | Feature | Plain Textarea | ProseMirror |
 |---------|----------------|-------------|
@@ -168,19 +198,13 @@ The ~80KB cost is worth it for **true collaborative editing** where two users ca
 **Key Code: CIA Dropdowns (Y.Map)**
 
 ```typescript
-// Still using Y.Map for simple key-value fields
-const ciaMap = ydoc.getMap('cia');
-ciaMap.observe(() => {
-  setCia({
-    confidentiality: ciaMap.get('confidentiality') || 'Low',
-    integrity: ciaMap.get('integrity') || 'Low',
-    availability: ciaMap.get('availability') || 'Low',
-  });
-});
-
+// Simple assignment triggers Yjs sync AND React re-render
 const handleCiaChange = (field, value) => {
-  ciaMap.set(field, value); // Propagates to all users
+  state.cia[field] = value; 
 };
+
+// UI uses the reactive state directly
+<select value={state.cia.confidentiality || 'Low'} ... />
 ```
 
 ---
@@ -195,21 +219,21 @@ One of the most important aspects of building a real-time app is understanding h
 ┌─────────────────────────────────────────────────────────────────┐
 │                    BROWSER (React Component)                     │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │   Local React State                                       │   │
-│  │   • useState for cia, notes, connected, users            │   │
-│  │   • Provides immediate UI responsiveness                 │   │
+│  │   SyncedStore Proxy (Reactive State)                      │   │
+│  │   • state.cia, state.controls, state.prosemirror          │   │
+│  │   • Triggers automatic React re-renders                   │   │
 │  └───────────────────────┬─────────────────────────────────┘   │
 │                          │                                       │
 │  ┌───────────────────────▼─────────────────────────────────┐   │
 │  │   Yjs Document (Y.Doc)                                    │   │
-│  │   • Y.Map('cia') → key-value for dropdowns               │   │
-│  │   • Y.Text('notes') → collaborative text                 │   │
-│  │   • Source of truth for shared state                     │   │
+│  │   • Managed by SyncedStore                                │   │
+│  │   • Source of truth for CRDT operations                   │   │
+│  │   • Handles binary update encoding                        │   │
 │  └───────────────────────┬─────────────────────────────────┘   │
 └──────────────────────────┼──────────────────────────────────────┘
                            │ WebSocket (real-time sync)
 ┌──────────────────────────▼──────────────────────────────────────┐
-│                    SERVER (Node.js + y-websocket)               │
+│                    SERVER (Node.js + @y/websocket-server)       │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │   In-Memory Y.Doc instances (per document room)          │   │
 │  │   • Merges updates from all connected clients            │   │
@@ -217,33 +241,35 @@ One of the most important aspects of building a real-time app is understanding h
 │  └───────────────────────┬─────────────────────────────────┘   │
 │                          │                                       │
 │  ┌───────────────────────▼─────────────────────────────────┐   │
-│  │   SQLite Database                                         │   │
-│  │   • document_snapshots table                             │   │
-│  │   • Stores encoded Y.Doc state as BLOB                   │   │
-│  │   • Survives server restarts                             │   │
+│  │   SQLite via Prisma                                       │   │
+│  │   • documentSnapshots & documentUpdates tables            │   │
+│  │   • Durable persistence with binary BLOBs                 │   │
+│  │   • Efficient journaled writes                            │   │
 │  └─────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### React State vs. Yjs State
+### React + SyncedStore vs. Raw Yjs
 
-Understanding the relationship between React's local state and Yjs's shared state is crucial:
+Using **SyncedStore** removes the need for manual `useState` and `observe()` pairings.
 
-| Aspect | React State (`useState`) | Yjs State (`Y.Doc`) |
-|--------|--------------------------|---------------------|
-| **Scope** | Local to browser tab | Shared across all clients |
-| **Persistence** | Lost on page refresh | Persisted to database |
-| **Updates** | Immediate, synchronous | Eventually consistent |
-| **Purpose** | UI responsiveness | Data synchronization |
+| Aspect | Manual Management | SyncedStore Approach |
+|--------|-------------------|----------------------|
+| **Local Update** | `ciaMap.set(k, v)` | `state.cia.k = v` |
+| **UI Updates** | `ciaMap.observe(...)` | Automatic (Reactive Proxy) |
+| **Consistency** | Manual React state sync | Reflects Yjs state directly |
+| **Complexity** | High boilerplate | Low boilerplate |
 
-### Why Both?
+```typescript
+// Pattern: Automatic Reactive Sync
+// Changing a property on the proxy...
+state.cia.confidentiality = "High";
 
-We maintain **both** local React state and Yjs state because:
+// ...instantly updates the underlying Y.Doc AND 
+// triggers re-renders in all components using this state.
+```
 
-1. **Immediate Feedback**: When a user types, updating local state first ensures the UI feels responsive
-2. **Single Source of Truth**: Yjs is the authoritative source — React state is a *reflection* of it
-3. **Observer Pattern**: Yjs notifies React via observers when remote changes arrive
-
+This would be the pattern if we did not use syncedstore: 
 ```typescript
 // Pattern: Yjs → React (receiving remote changes)
 ciaMap.observe(() => {
@@ -263,91 +289,21 @@ const handleCiaChange = (field: string, value: string) => {
 
 ### User Presence with Awareness
 
-Yjs provides an **Awareness** protocol for tracking who's connected:
+Yjs provides an **Awareness** protocol for tracking who's connected (ephemeral state):
 
 ```typescript
 const awareness = provider.awareness;
-const color = COLORS[Math.floor(Math.random() * COLORS.length)];
 
 // Set local user's info
-awareness.setLocalStateField('user', { name: userName, color });
+awareness.setLocalStateField('user', { name: userName, color: '#f87171' });
 
 // Listen for changes in who's online
 awareness.on('change', () => {
-  const states = Array.from(awareness.getStates().values());
-  const activeUsers = states.map(s => s.user?.name).filter(Boolean);
-  setUsers(activeUsers);
+    const states = Array.from(awareness.getStates().values());
+    const activeUsers = states.map(s => s.user?.name).filter(Boolean);
+    setUsers(activeUsers);
 });
 ```
-
-This is separate from document state — awareness is ephemeral and not persisted.
-
-### Simplifying State with SyncedStore
-
-Managing raw Yjs observers and React state synchronization can get verbose. We simplified this using **SyncedStore** — a library that wraps Yjs with a reactive proxy API:
-
-```bash
-npm install @syncedstore/core @syncedstore/react
-```
-
-**Defining the Store Shape**
-
-```typescript
-// lib/store.ts
-import { syncedStore, getYjsDoc } from "@syncedstore/core";
-
-interface StoreShape {
-    cia: {
-        confidentiality?: string;
-        integrity?: string;
-        availability?: string;
-    };
-    controls: Record<string, boolean>;
-    prosemirror: any; // Special "xml" type for ProseMirror
-}
-
-export const createStore = () => syncedStore({
-    cia: {},
-    controls: {},
-    prosemirror: "xml",
-}) as StoreShape;
-
-export { getYjsDoc };
-```
-
-**Using SyncedStore in React**
-
-```typescript
-import { useSyncedStore } from '@syncedstore/react';
-import { createStore, getYjsDoc } from '../lib/store';
-
-function RiskAssessmentEditor({ documentId }: Props) {
-    // Create a store per document
-    const docStore = useMemo(() => createStore(), [documentId]);
-    const state = useSyncedStore(docStore);
-
-    // State updates are now reactive — no manual observers!
-    const handleCiaChange = (field: keyof typeof state.cia, value: string) => {
-        state.cia[field] = value;  // Triggers re-render automatically
-    };
-
-    return (
-        <select
-            value={state.cia.confidentiality || 'Low'}
-            onChange={(e) => handleCiaChange('confidentiality', e.target.value)}
-        >
-            {/* options */}
-        </select>
-    );
-}
-```
-
-| Approach | Boilerplate | React Integration | Learning Curve |
-|----------|-------------|-------------------|----------------|
-| Raw Yjs + observers | High | Manual `useState` sync | Steeper |
-| SyncedStore | Low | Automatic via proxy | Gentler |
-
-> **When to use raw Yjs**: If you need fine-grained control over transactions or custom CRDT types. Otherwise, SyncedStore significantly reduces boilerplate.
 
 ---
 
@@ -362,19 +318,20 @@ User A's Browser                Server                    User B's Browser
 ──────────────────             ────────                   ──────────────────
 1. onChange fires
    ↓
-2. ciaMap.set('confidentiality', 'High')
+2. state.cia.confidentiality = "High"
    ↓
-3. WebsocketProvider encodes → ─────────────────────→ 4. Server receives update
+3. SyncedStore updates Y.Doc
+   ↓
+4. WebsocketProvider encodes → ─────────────────────→ 5. Server receives update
    Yjs update binary                                        ↓
-                                                      5. Broadcasts to all clients
+                                                      6. Broadcasts to all clients
                                                             │
    ←───────────────────────────────────────────────────────←┘
    ↓
-6. Local ciaMap.observe()
-   fires (same as remote)         
-   ↓                                                   7. User B's ciaMap.observe() fires
-7. setCia() updates UI                                    ↓
-                                                      8. setCia() updates UI
+7. SyncedStore proxy in User B's 
+   browser detects change
+   ↓
+8. React re-renders B's UI
 ```
 
 ### The CRDT Magic
@@ -424,25 +381,25 @@ Our persistence strategy goes beyond simple "save on every keystroke." We implem
 
 ### Implementation: Debounced Flushing
 
-Updates are batched into a `pending` array and flushed after 50ms of inactivity:
+Updates are batched into a `pendingUpdates` array and flushed after 50ms of inactivity:
 
 ```typescript
 // persistence.ts
-export function scheduleFlush(docId: string) {
-    const meta = getOrCreateMeta(docId);
+export function scheduleFlush(docId: string, doc: Y.Doc) {
+    const meta = getOrCreateMeta(docId, doc);
     
     if (meta.flushTimer) clearTimeout(meta.flushTimer);
     meta.flushTimer = setTimeout(() => {
         meta.flushTimer = null;
-        void flushPendingUpdates(docId);
+        void flushPendingUpdates(docId, doc);
     }, 50);  // 50ms debounce
 }
 
-async function flushPendingUpdates(docId: string) {
-    const meta = docMeta.get(docId);
-    if (!meta || meta.pending.length === 0) return;
+async function flushPendingUpdates(docId: string, doc?: Y.Doc) {
+    const meta = documentMetadataMap.get(docId);
+    if (!meta || meta.pendingUpdates.length === 0) return;
 
-    const merged = Y.mergeUpdates(meta.pending);
+    const merged = Y.mergeUpdates(meta.pendingUpdates);
     
     try {
         await prisma.documentUpdate.create({
@@ -452,53 +409,46 @@ async function flushPendingUpdates(docId: string) {
                 createdAt: BigInt(Date.now()),
             },
         });
-        // Only clear after successful write to prevent data loss
-        meta.pending = [];
+        // Clear pending ONLY after successful DB write
+        meta.pendingUpdates = [];
+        meta.updatesSinceLastCompaction += 1;
+        
+        // Parallel: Sync CIA values to the Document table
+        if (doc) await syncDocumentCIAValues(docId, doc);
     } catch (error) {
-        console.error(`Failed to flush:`, error);
-        // Keep pending — will retry on next flush
+        console.error(`[Flush] Failed for ${docId}:`, error);
     }
 }
 ```
 
 ### Implementation: Periodic Compaction
 
-Every 10 seconds, we compact all pending updates into a single snapshot:
+Every 10 seconds, we compact all pending updates into a single snapshot to prevent the update journal from growing indefinitely:
 
 ```typescript
 export function startCompactionTimer(docId: string, doc: Y.Doc) {
-    const meta = getOrCreateMeta(docId);
-    if (meta.compactTimer) return;
+    const meta = getOrCreateMeta(docId, doc);
+    if (meta.compactionTimer) return;
 
-    meta.compactTimer = setInterval(() => {
-        void compactDoc(docId, doc);
-    }, 10_000);  // 10 seconds
+    meta.compactionTimer = setInterval(() => {
+        void compactDocument(docId, doc);
+    }, 10_000);
 }
 
-async function compactDoc(docId: string, doc: Y.Doc) {
-    await flushPendingUpdates(docId);  // Flush first
+async function compactDocument(docId: string, doc: Y.Doc) {
+    await flushPendingUpdates(docId, doc); // Ensure last updates are flushed
     
     const snapshot = Y.encodeStateAsUpdate(doc);
     
-    // Extract CIA values for the sidecar Document table
-    const ciaMap = doc.getMap('cia');
-    const cia = ciaMap.toJSON();
-    
     await prisma.$transaction([
+        // 1. Save full state to snapshot table
         prisma.documentSnapshot.upsert({
             where: { documentId: docId },
             update: { snapshot: Buffer.from(snapshot), updatedAt: BigInt(Date.now()) },
             create: { documentId: docId, snapshot: Buffer.from(snapshot), updatedAt: BigInt(Date.now()) },
         }),
+        // 2. Clear the incremental update journal
         prisma.documentUpdate.deleteMany({ where: { documentId: docId } }),
-        prisma.document.update({
-            where: { id: docId },
-            data: {
-                confidentiality: ciaToInt(cia.confidentiality),
-                integrity: ciaToInt(cia.integrity),
-                availability: ciaToInt(cia.availability),
-            },
-        }),
     ]);
 }
 ```
@@ -840,20 +790,22 @@ ySyncPlugin(yXmlFragment);  // Works correctly
 
 **Impact**: Because `flushPendingUpdates()` needs the `Y.Doc` to extract and sync "sidecar" metadata (like CIA security labels), these values were NOT being synced during a graceful shutdown. Only the binary Yjs updates were saved.
 
-**Solution**: Track the active `Y.Doc` objects within the persistence layer metadata.
+**Solution**: Track the active `Y.Doc` objects within the `documentMetadataMap`.
 
 ```typescript
 // persistence.ts
-interface DocMeta {
-    pending: Uint8Array[];
-    doc?: Y.Doc; // Track doc object
+interface DocumentMetadata {
+    pendingUpdates: Uint8Array[];
+    yjsDocument?: Y.Doc; // Track doc object
     // ...
 }
 
 export async function shutdown() {
-    for (const [docId, meta] of docMeta) {
-        // Now we can pass meta.doc to ensure CIA sync!
-        await flushPendingUpdates(docId, meta.doc);
+    for (const [docId, meta] of documentMetadataMap) {
+        // Now we can pass meta.yjsDocument to ensure CIA sync!
+        if (meta.yjsDocument) {
+            await flushPendingUpdates(docId, meta.yjsDocument);
+        }
     }
 }
 ```
@@ -892,7 +844,7 @@ When following tutorials, pay close attention to library versions. The JS ecosys
   "yjs": "^13.6.x",
   "y-websocket": "^3.0.0",
   "@y/websocket-server": "^0.1.1",
-  "better-sqlite3": "^12.x"
+  "@prisma/client": "^7.1.x"
 }
 ```
 
@@ -1030,12 +982,12 @@ The standard `auth()` helper works great for HTTP requests, but WebSockets are t
 
 **The Solution**: When the browser initiates the WebSocket connection, it sends an HTTP `GET` request with an `Upgrade` header. This request **includes cookies**. We can use `decode` from `next-auth/jwt` to verify the session cookie manually on the server.
 
-**Implementation: Custom Server Authentication**
+**Implementation: Custom Server Authentication (server.ts)**
 
-```javascript
-// server.js
-const { decode } = require("next-auth/jwt");
-const { parse } = require("cookie");
+```typescript
+// server.ts
+import { decode } from "next-auth/jwt";
+import { parse } from "cookie";
 
 server.on('upgrade', async (request, socket, head) => {
   try {
