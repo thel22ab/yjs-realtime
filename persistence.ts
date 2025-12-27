@@ -1,101 +1,30 @@
-// persistence.ts
 /**
- * Handles SQLite persistence for Yjs documents using Prisma 7.
- * 
- * This module provides:
- * - Document metadata tracking with pending updates
- * - Debounced flush operations for batched writes
- * - Periodic compaction to optimize storage
- * - CIA (Confidentiality, Integrity, Availability) synchronization
- * 
- * @module persistence
+ * SQLite persistence for Yjs documents using Prisma 7.
+ * Handles debounced writes, periodic compaction, and CIA synchronization.
  */
 
 import * as Y from "yjs";
 import prisma from "./lib/db";
 
-// ---- Configuration Constants ----
-
-/** Delay in milliseconds for debouncing flush operations. */
 const DEBOUNCE_DELAY_MS = 50;
-
-/** Interval in milliseconds for periodic compaction (10 seconds for testing, normally 60000). */
 const COMPACTION_INTERVAL_MS = 10_000;
-
-/** Origin identifier for updates applied from persistence layer. */
 export const YJS_ORIGIN_PERSISTENCE = "persistence";
 
-// ---- CIA Level Mappings ----
+// CIA level mapping (string -> numeric for database)
+const CIA_LEVELS = { Low: 1, Medium: 2, High: 3, Critical: 3 } as const;
+const parseCiaLevel = (value?: string) => (value && CIA_LEVELS[value as keyof typeof CIA_LEVELS]) || 0;
 
-/**
- * CIA level string values from the Yjs document.
- */
-type CiaLevelValue = string | undefined;
-
-/**
- * CIA level enumeration for internal calculations.
- */
-enum CiaLevel {
-    NotSet = 0,
-    Low = 1,
-    Medium = 2,
-    High = 3,
-}
-
-/**
- * Maps a CIA string value to its numeric level.
- * 
- * @param value - The CIA level string ('Low', 'Medium', 'High', 'Critical')
- * @returns The numeric level (0-3), where 0 means not set
- */
-function parseCiaLevel(value: CiaLevelValue): CiaLevel {
-    switch (value) {
-        case 'Low':
-            return CiaLevel.Low;
-        case 'Medium':
-            return CiaLevel.Medium;
-        case 'High':
-            return CiaLevel.High;
-        case 'Critical':
-            return CiaLevel.High; // Map Critical to High (3)
-        default:
-            return CiaLevel.NotSet;
-    }
-}
-
-// ---- In-memory Document Metadata ----
-
-/**
- * Metadata tracked for each active document.
- * Manages pending updates, timers, and compaction state.
- */
 interface DocumentMetadata {
-    /** Array of pending updates waiting to be flushed to the database. */
     pendingUpdates: Uint8Array[];
-
-    /** Timer for debounced flush operations. */
     flushTimer: NodeJS.Timeout | null;
-
-    /** Timer for periodic compaction operations. */
     compactionTimer: NodeJS.Timeout | null;
-
-    /** Number of update rows written since the last compaction. */
     updatesSinceLastCompaction: number;
-
-    /** Reference to the Yjs document for CIA synchronization. */
     yjsDocument?: Y.Doc;
 }
 
-/** Map of document IDs to their metadata. */
 const documentMetadataMap = new Map<string, DocumentMetadata>();
 
-/**
- * Retrieves existing metadata for a document or creates new metadata if none exists.
- * 
- * @param docId - The unique identifier for the document
- * @param yjsDoc - Optional Yjs document reference to associate with the metadata
- * @returns The document metadata
- */
+/** Gets or creates metadata for a document. */
 export function getOrCreateMeta(docId: string, yjsDoc?: Y.Doc): DocumentMetadata {
     let meta = documentMetadataMap.get(docId);
     if (!meta) {
@@ -108,35 +37,15 @@ export function getOrCreateMeta(docId: string, yjsDoc?: Y.Doc): DocumentMetadata
         };
         documentMetadataMap.set(docId, meta);
     } else if (yjsDoc) {
-        // Update document reference if provided
         meta.yjsDocument = yjsDoc;
     }
     return meta;
 }
 
-// ---- Persistence Helper Functions ----
+const mergePendingUpdates = (meta: DocumentMetadata) =>
+    meta.pendingUpdates.length > 0 ? Y.mergeUpdates(meta.pendingUpdates) : null;
 
-/**
- * Merges all pending updates for a document into a single update blob.
- * 
- * @param meta - The document metadata containing pending updates
- * @returns The merged update blob, or null if no updates are pending
- */
-async function mergePendingUpdates(meta: DocumentMetadata): Promise<Uint8Array | null> {
-    if (meta.pendingUpdates.length === 0) {
-        return null;
-    }
-    return Y.mergeUpdates(meta.pendingUpdates);
-}
-
-/**
- * Persists a merged update blob to the database.
- * 
- * @param docId - The document identifier
- * @param mergedUpdate - The merged update blob to persist
- * @returns A promise that resolves when the update is persisted
- */
-async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array): Promise<void> {
+async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array) {
     await prisma.documentUpdate.create({
         data: {
             documentId: docId,
@@ -146,32 +55,17 @@ async function persistMergedUpdate(docId: string, mergedUpdate: Uint8Array): Pro
     });
 }
 
-/**
- * Synchronizes CIA (Confidentiality, Integrity, Availability) values
- * from the Yjs document to the database.
- * 
- * @param docId - The document identifier
- * @param doc - The Yjs document containing CIA values
- * @returns A promise that resolves when CIA values are synchronized
- */
-async function syncDocumentCIAValues(docId: string, doc: Y.Doc): Promise<void> {
-    const ciaMap = doc.getMap('cia');
-    const rawCia = ciaMap.toJSON();
-
-    const confidentiality = parseCiaLevel(rawCia.confidentiality);
-    const integrity = parseCiaLevel(rawCia.integrity);
-    const availability = parseCiaLevel(rawCia.availability);
+async function syncDocumentCIAValues(docId: string, doc: Y.Doc) {
+    const rawCia = doc.getMap('cia').toJSON();
+    const data = {
+        confidentiality: parseCiaLevel(rawCia.confidentiality),
+        integrity: parseCiaLevel(rawCia.integrity),
+        availability: parseCiaLevel(rawCia.availability),
+    };
 
     try {
-        await prisma.document.update({
-            where: { id: docId },
-            data: {
-                confidentiality,
-                integrity,
-                availability,
-            },
-        });
-        console.log(`[CIA Sync] Updated ${docId}: C=${confidentiality} I=${integrity} A=${availability}`);
+        await prisma.document.update({ where: { id: docId }, data });
+        console.log(`[CIA Sync] Updated ${docId}: C=${data.confidentiality} I=${data.integrity} A=${data.availability}`);
     } catch (error) {
         console.error(`[CIA Sync] Failed for ${docId}:`, error);
     }

@@ -39,53 +39,18 @@ interface DocumentSummary {
     createdAt: string;
 }
 
-// ---- CIA Display Helpers ----
+// CIA display configuration
+const CIA_CONFIG = {
+    0: { color: 'bg-gray-200 text-gray-600', label: '-' },
+    1: { color: 'bg-green-100 text-green-700', label: 'Low' },
+    2: { color: 'bg-yellow-100 text-yellow-700', label: 'Med' },
+    3: { color: 'bg-red-100 text-red-700', label: 'High' },
+} as const;
 
-/**
- * CIA numeric level type (0-3 based on database schema).
- */
-type CiaLevel = 0 | 1 | 2 | 3;
-
-/**
- * Maps CIA level number to CSS color class for badge styling.
- */
-const CIA_LEVEL_COLORS: Record<CiaLevel, string> = {
-    0: 'bg-gray-200 text-gray-600',
-    1: 'bg-green-100 text-green-700',
-    2: 'bg-yellow-100 text-yellow-700',
-    3: 'bg-red-100 text-red-700',
-};
-
-/**
- * Maps CIA level number to display label.
- */
-const CIA_LEVEL_LABELS: Record<CiaLevel, string> = {
-    0: '-',
-    1: 'Low',
-    2: 'Med',
-    3: 'High',
-};
-
-/**
- * Gets the color class for a CIA level badge.
- */
-function getCIAColor(level: number): string {
-    const normalizedLevel = Math.min(Math.max(Math.round(level), 0), 3) as CiaLevel;
-    return CIA_LEVEL_COLORS[normalizedLevel];
-}
-
-/**
- * Gets the display label for a CIA level.
- */
-function getCIALabel(level: number): string {
-    const normalizedLevel = Math.min(Math.max(Math.round(level), 0), 3) as CiaLevel;
-    return CIA_LEVEL_LABELS[normalizedLevel];
-}
-
-// ---- Component Props ----
+const getCIA = (level: number) =>
+    CIA_CONFIG[Math.min(Math.max(Math.round(level), 0), 3) as 0 | 1 | 2 | 3];
 
 interface DashboardProps {
-    /** Initial documents to display when the component loads. */
     initialDocuments: DocumentSummary[];
 }
 
@@ -181,14 +146,14 @@ export default function Dashboard({ initialDocuments }: DashboardProps) {
 
                             {/* CIA Subtitle */}
                             <div className="flex gap-2 mb-3">
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIAColor(doc.confidentiality)}`}>
-                                    C: {getCIALabel(doc.confidentiality)}
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIA(doc.confidentiality).color}`}>
+                                    C: {getCIA(doc.confidentiality).label}
                                 </span>
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIAColor(doc.integrity)}`}>
-                                    I: {getCIALabel(doc.integrity)}
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIA(doc.integrity).color}`}>
+                                    I: {getCIA(doc.integrity).label}
                                 </span>
-                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIAColor(doc.availability)}`}>
-                                    A: {getCIALabel(doc.availability)}
+                                <span className={`px-2 py-0.5 rounded text-xs font-medium ${getCIA(doc.availability).color}`}>
+                                    A: {getCIA(doc.availability).label}
                                 </span>
                             </div>
 

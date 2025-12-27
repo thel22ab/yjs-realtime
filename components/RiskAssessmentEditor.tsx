@@ -32,7 +32,7 @@ import { createStore, getYjsDoc } from '@/lib/store';
 interface RiskAssessmentEditorProps {
     /** Unique identifier for the document being edited. */
     documentId: string;
-    
+
     /** Name of the user for presence/awareness display. */
     userName: string;
 }
@@ -41,7 +41,7 @@ interface RiskAssessmentEditorProps {
 
 /** Available user cursor colors for collaborative editing. */
 const CURSOR_COLORS = [
-    '#f87171', '#fb923c', '#fbbf24', '#a3e635', 
+    '#f87171', '#fb923c', '#fbbf24', '#a3e635',
     '#34d399', '#22d3ee', '#818cf8', '#c084fc'
 ];
 
@@ -121,14 +121,14 @@ function calculateRequiredControls(
 
     // Rule 1: High confidentiality (> 4) requires encryption and access controls
     if (confidentialityScore > 4) {
-        ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(control => 
+        ['encryption_at_rest', 'mfa_enforced', 'access_logging'].forEach(control =>
             requiredControls.add(control)
         );
     }
 
     // Rule 2: High total risk (> 12) requires all controls
     if (totalScore > 12) {
-        Object.keys(SECURITY_CONTROL_CATALOG).forEach(control => 
+        Object.keys(SECURITY_CONTROL_CATALOG).forEach(control =>
             requiredControls.add(control)
         );
     }
@@ -136,61 +136,27 @@ function calculateRequiredControls(
     return requiredControls;
 }
 
-/**
- * Selects a random cursor color for the current user.
- */
-function getRandomCursorColor(): string {
-    return CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)];
-}
+type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
 
-/**
- * Determines connection status display text based on state.
- */
-function getConnectionStatusText(
-    isOnline: boolean, 
-    connectionStatus: 'connecting' | 'connected' | 'disconnected'
-): string {
-    if (!isOnline) return 'Offline Mode';
-    if (connectionStatus === 'connected') return 'Synchronized';
-    if (connectionStatus === 'connecting') return 'Connecting...';
-    return 'Offline Mode';
-}
+const STATUS_CONFIG = {
+    offline: { text: 'Offline Mode', indicator: 'bg-amber-500', textClass: 'text-amber-700' },
+    connected: { text: 'Synchronized', indicator: 'bg-green-500', textClass: 'text-green-700' },
+    connecting: { text: 'Connecting...', indicator: 'bg-yellow-500 animate-pulse', textClass: 'text-yellow-700' },
+} as const;
 
-/**
- * Determines CSS class for status indicator based on state.
- */
-function getStatusIndicatorClass(
-    isOnline: boolean,
-    connectionStatus: 'connecting' | 'connected' | 'disconnected'
-): string {
-    if (!isOnline) return 'bg-amber-500';
-    if (connectionStatus === 'connected') return 'bg-green-500';
-    if (connectionStatus === 'connecting') return 'bg-yellow-500 animate-pulse';
-    return 'bg-amber-500';
-}
-
-/**
- * Determines CSS class for status text based on state.
- */
-function getStatusTextClass(
-    isOnline: boolean,
-    connectionStatus: 'connecting' | 'connected' | 'disconnected'
-): string {
-    if (!isOnline) return 'text-amber-700';
-    if (connectionStatus === 'connected') return 'text-green-700';
-    if (connectionStatus === 'connecting') return 'text-yellow-700';
-    return 'text-amber-700';
+function getStatusKey(isOnline: boolean, status: ConnectionStatus): keyof typeof STATUS_CONFIG {
+    return !isOnline || status === 'disconnected' ? 'offline' : status;
 }
 
 // ---- Component ----
 
-export default function RiskAssessmentEditor({ 
-    documentId, 
-    userName 
+export default function RiskAssessmentEditor({
+    documentId,
+    userName
 }: RiskAssessmentEditorProps) {
     const editorRef = useRef<HTMLDivElement>(null);
     const viewRef = useRef<EditorView | null>(null);
-    
+
     const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('connecting');
     const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
     const [activeUsers, setActiveUsers] = useState<string[]>([]);
@@ -240,7 +206,7 @@ export default function RiskAssessmentEditor({
 
         // Configure awareness for cursor positions
         const awareness = provider.awareness;
-        const userColor = getRandomCursorColor();
+        const userColor = CURSOR_COLORS[Math.floor(Math.random() * CURSOR_COLORS.length)];
         awareness.setLocalStateField('user', { name: userName, color: userColor });
 
         awareness.on('change', () => {
@@ -280,8 +246,8 @@ export default function RiskAssessmentEditor({
         const availabilityScore = calculateCiaWeight(storeState.cia.availability ?? DEFAULT_CIA_LEVEL);
 
         const requiredControls = calculateRequiredControls(
-            confidentialityScore, 
-            integrityScore, 
+            confidentialityScore,
+            integrityScore,
             availabilityScore
         );
 
@@ -299,32 +265,22 @@ export default function RiskAssessmentEditor({
             }
         });
     }, [
-        storeState.cia.confidentiality, 
-        storeState.cia.integrity, 
+        storeState.cia.confidentiality,
+        storeState.cia.integrity,
         storeState.cia.availability
     ]);
 
-    // ---- Event Handlers ----
-
-    /**
-     * Handles changes to CIA level dropdowns.
-     */
-    const handleCiaChange = (field: keyof typeof storeState.cia, value: string): void => {
+    const handleCiaChange = (field: keyof typeof storeState.cia, value: string) => {
         storeState.cia[field] = value;
     };
 
-    /**
-     * Toggles a security control on or off.
-     */
-    const toggleControl = (controlId: string): void => {
+    const toggleControl = (controlId: string) => {
         storeState.controls[controlId] = !storeState.controls[controlId];
     };
 
     // ---- Render ----
 
-    const statusText = getConnectionStatusText(isOnline, connectionStatus);
-    const statusIndicatorClass = getStatusIndicatorClass(isOnline, connectionStatus);
-    const statusTextClass = getStatusTextClass(isOnline, connectionStatus);
+    const status = STATUS_CONFIG[getStatusKey(isOnline, connectionStatus)];
 
     return (
         <div className="bg-white p-6 rounded-lg shadow-sm border border-gray-200">
@@ -333,18 +289,18 @@ export default function RiskAssessmentEditor({
                 <div>
                     <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-1">Document Status</h2>
                     <div className="flex items-center gap-2">
-                        <span className={`w-2 h-2 rounded-full ${statusIndicatorClass}`}></span>
-                        <span className={`font-medium text-sm ${statusTextClass}`}>
-                            {statusText}
+                        <span className={`w-2 h-2 rounded-full ${status.indicator}`}></span>
+                        <span className={`font-medium text-sm ${status.textClass}`}>
+                            {status.text}
                         </span>
                     </div>
                 </div>
 
                 <div className="flex -space-x-2">
                     {activeUsers.map((user, index) => (
-                        <div 
-                            key={index} 
-                            className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600" 
+                        <div
+                            key={index}
+                            className="w-8 h-8 rounded-full bg-blue-100 border-2 border-white flex items-center justify-center text-xs font-bold text-blue-600"
                             title={user}
                         >
                             {user.charAt(0).toUpperCase()}
