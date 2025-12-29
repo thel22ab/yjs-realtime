@@ -64,11 +64,29 @@ async function syncDocumentCIAValues(docId: string, doc: Y.Doc) {
     };
 
     try {
-        await prisma.document.update({ where: { id: docId }, data });
+        // Use upsert with unchecked input to handle the case where the document doesn't exist
+        // Also update timestamp on upsert
+        await prisma.document.upsert({
+            where: { id: docId },
+            update: { ...data },
+            create: { id: docId, title: docId, ...data },
+        });
         console.log(`[CIA Sync] Updated ${docId}: C=${data.confidentiality} I=${data.integrity} A=${data.availability}`);
     } catch (error) {
-        console.error(`[CIA Sync] Failed for ${docId}:`, error);
+        logPersistenceError('CIA Sync', docId, error);
     }
+}
+
+/**
+ * Gets CIA values as update data for transaction use.
+ */
+function getCIAUpdateData(doc: Y.Doc) {
+    const rawCia = doc.getMap('cia').toJSON();
+    return {
+        confidentiality: parseCiaLevel(rawCia.confidentiality),
+        integrity: parseCiaLevel(rawCia.integrity),
+        availability: parseCiaLevel(rawCia.availability),
+    };
 }
 
 /**
@@ -120,7 +138,10 @@ async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
         console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
 
         // Also update CIA values in the sidecar document table
-        await syncDocumentCIAValues(docId, doc!);
+        // Only call if doc is provided (it should be in this code path)
+        if (doc) {
+            await syncDocumentCIAValues(docId, doc);
+        }
     } catch (error) {
         logPersistenceError('Flush', docId, error);
     }
@@ -149,13 +170,18 @@ export function scheduleFlush(docId: string, doc: Y.Doc): void {
 
     console.log(`[Schedule] Scheduling flush for ${docId}, pending: ${meta.pendingUpdates.length}`);
 
-    if (meta.flushTimer) {
-        clearTimeout(meta.flushTimer);
-    }
-    meta.flushTimer = setTimeout(() => {
+    try {
+        if (meta.flushTimer) {
+            clearTimeout(meta.flushTimer);
+        }
+        meta.flushTimer = setTimeout(() => {
+            meta.flushTimer = null;
+            void flushPendingUpdates(docId, doc);
+        }, DEBOUNCE_DELAY_MS);
+    } catch (error) {
+        logPersistenceError('Timer', docId, error);
         meta.flushTimer = null;
-        void flushPendingUpdates(docId, doc);
-    }, DEBOUNCE_DELAY_MS);
+    }
 }
 
 /**
@@ -171,9 +197,14 @@ export function startCompactionTimer(docId: string, doc: Y.Doc): void {
         return;
     }
 
-    meta.compactionTimer = setInterval(() => {
-        void compactDocument(docId, doc);
-    }, COMPACTION_INTERVAL_MS);
+    try {
+        meta.compactionTimer = setInterval(() => {
+            void compactDocument(docId, doc);
+        }, COMPACTION_INTERVAL_MS);
+    } catch (error) {
+        logPersistenceError('Timer', docId, error);
+        meta.compactionTimer = null;
+    }
 }
 
 /**
@@ -220,10 +251,13 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
     const snapshotBuffer = Buffer.from(snapshot);
     const currentTimestamp = BigInt(Date.now());
 
+    // Get CIA values before transaction for atomicity
+    const ciaData = getCIAUpdateData(doc);
+
     try {
         console.log(`[Compaction] Executing transaction for ${docId}`);
 
-        // Transaction: Save Snapshot + Delete Updates
+        // Transaction: Save Snapshot + Delete Updates + Sync CIA values atomically
         await prisma.$transaction([
             prisma.documentSnapshot.upsert({
                 where: { documentId: docId },
@@ -240,10 +274,13 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
             prisma.documentUpdate.deleteMany({
                 where: { documentId: docId },
             }),
+            // Include CIA sync in transaction for atomicity
+            prisma.document.upsert({
+                where: { id: docId },
+                update: { ...ciaData },
+                create: { id: docId, title: docId, ...ciaData },
+            }),
         ]);
-
-        // Also update CIA values to ensure they are in sync
-        await syncDocumentCIAValues(docId, doc);
 
         if (meta) {
             meta.updatesSinceLastCompaction = 0;
