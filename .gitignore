@@ -42,3 +42,6 @@ next-env.d.ts
 
 # prisma (generated on install)
 /prisma/generated
+risk-assessments.db-shm
+risk-assessments.db-wal
+.gitignore

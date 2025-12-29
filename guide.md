@@ -35,6 +35,47 @@ To achieve real-time collaboration with persistence, we chose a **Hybrid Archite
 
 Standard Next.js Server Actions are great for request/response flows, but real-time collaboration requires **long-lived connections** (WebSockets). By using a custom server, we can attach a WebSocket server to the same HTTP server that Next.js uses, simplifying deployment to a single service.
 
+### Architecture Diagram
+
+```mermaid
+graph TD
+    %% Node Styles
+    classDef client fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#0d47a1
+    classDef server fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#4a148c
+    classDef db fill:#fff3e0,stroke:#ef6c00,stroke-width:2px,color:#e65100
+
+    subgraph Browser ["Client (Browser)"]
+        direction TB
+        UI["React UI Components<br/>(SyncedStore Hooks)"]:::client
+        YJS_CLIENT["Yjs Client<br/>(CRDT Store)"]:::client
+        
+        UI --- YJS_CLIENT
+    end
+
+    subgraph NodeServer ["Custom Node.js Server"]
+        direction TB
+        NEXT_SRV["Next.js Server<br/>(App Router & API)"]:::server
+        WS_SRV["WebSocket Server<br/>(@y/websocket-server)"]:::server
+        YJS_SERVER["In-Memory Y.Docs<br/>(Shared State)"]:::server
+        
+        NEXT_SRV -- "Http Upgrade" --o WS_SRV
+        WS_SRV --- YJS_SERVER
+    end
+
+    subgraph Persistence ["Persistence Layer"]
+        PRISMA[("SQLite Database<br/>(Prisma + WAL)")]:::db
+    end
+
+    %% Network Relationships
+    UI -- "HTTP GET/POST<br/>(Auth / Assets)" --> NEXT_SRV
+    YJS_CLIENT == "WebSocket (ws://)<br/>Binary Sync Protocol" ==> WS_SRV
+
+    %% Persistence Relationships
+    YJS_SERVER -- "1. Debounced Flush<br/>(Increments)" --> PRISMA
+    YJS_SERVER -- "2. Periodic Compaction<br/>(Snapshots)" --> PRISMA
+    PRISMA -- "Load on Init" --> YJS_SERVER
+```
+
 ---
 
 ## 2. Implementation Steps
@@ -313,25 +354,33 @@ awareness.on('change', () => {
 
 When User A changes the "Confidentiality" dropdown from "Low" to "High":
 
-```
-User A's Browser                Server                    User B's Browser
-──────────────────             ────────                   ──────────────────
-1. onChange fires
-   ↓
-2. state.cia.confidentiality = "High"
-   ↓
-3. SyncedStore updates Y.Doc
-   ↓
-4. WebsocketProvider encodes → ─────────────────────→ 5. Server receives update
-   Yjs update binary                                        ↓
-                                                      6. Broadcasts to all clients
-                                                            │
-   ←───────────────────────────────────────────────────────←┘
-   ↓
-7. SyncedStore proxy in User B's 
-   browser detects change
-   ↓
-8. React re-renders B's UI
+```mermaid
+sequenceDiagram
+    autonumber
+    participant UserA as 👤 User A
+    participant Proxy as 🔄 SyncedStore Proxy
+    participant YDoc as 📝 Yjs Doc
+    participant Server as 🖥️ Server
+    participant UserB as 👤 User B
+
+    Note over UserA, Proxy: 1. User Interaction
+    UserA->>Proxy: Change "Confidentiality" to "High"
+    Proxy->>YDoc: Update Y.Map (local)
+    
+    par React Reactivity
+        Proxy-->>UserA: Trigger Re-render (Optimistic UI)
+    and Sync to Server
+        YDoc->>Server: Send Binary Update (WebSocket)
+    end
+
+    Note over Server: 2. Propagation
+    Server->>Server: Merge into In-Memory Doc
+    Server-->>UserB: Broadcast Update (WebSocket)
+
+    Note over UserB, YDoc: 3. Remote Sync
+    UserB->>YDoc: Apply Binary Update
+    YDoc->>Proxy: Notify Observers
+    Proxy-->>UserB: Trigger Re-render (Reactive)
 ```
 
 ### The CRDT Magic
@@ -347,28 +396,40 @@ Yjs uses **CRDTs (Conflict-free Replicated Data Types)** to handle concurrent ed
 
 Our persistence strategy goes beyond simple "save on every keystroke." We implemented a **three-tier system** for durability and efficiency:
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      SERVER PERSISTENCE FLOW                             │
-│                                                                          │
-│  Yjs Update Event                                                        │
-│        │                                                                 │
-│        ▼                                                                 │
-│  ┌──────────────┐    50ms debounce    ┌──────────────────────────────┐  │
-│  │ meta.pending │ ─────────────────►  │ flushPendingUpdates()        │  │
-│  │   (buffer)   │                     │ → Merge updates              │  │
-│  └──────────────┘                     │ → INSERT into document_updates│  │
-│                                       └──────────────────────────────┘  │
-│                                                   │                      │
-│                                                   ▼                      │
-│                               ┌──────────────────────────────────────┐  │
-│    Every 10 seconds ────────► │ compactDoc()                         │  │
-│                               │ → Encode full Y.Doc snapshot         │  │
-│                               │ → UPSERT into document_snapshots     │  │
-│                               │ → DELETE old document_updates        │  │
-│                               │ → UPDATE Document CIA values         │  │
-│                               └──────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    %% Nodes
+    Update["⚡ Incoming Yjs Update"]
+    Buffer["📦 In-Memory Buffer<br/>(pendingUpdates)"]
+    Debounce{"⏳ 50ms<br/>Inactivity?"}
+    Flush["🌊 Flush to DB"]
+    DB_Log[("📝 document_updates<br/>(Incremental Log)")]
+    CompactionTimer{"⏱️ Every 10s"}
+    Compact["🔨 Compact Document"]
+    DB_Snap[("📸 document_snapshots<br/>(Full State)")]
+    Sidecar[("🏷️ Document Metadata<br/>(CIA / Queryable Cols)")]
+
+    %% Styles
+    classDef event fill:#ffe0b2,stroke:#ef6c00,stroke-width:2px;
+    classDef logic fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    classDef db fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+
+    class Update,CompactionTimer event;
+    class Buffer,Debounce,Flush,Compact logic;
+    class DB_Log,DB_Snap,Sidecar db;
+
+    %% Flow
+    Update --> Buffer
+    Buffer --> Debounce
+    Debounce -- No --> Buffer
+    Debounce -- Yes --> Flush
+    Flush -- MERGE & INSERT --> DB_Log
+
+    CompactionTimer --> Compact
+    Compact -- "1. Read Full State" --> Buffer
+    Compact -- "2. UPSERT Snapshot" --> DB_Snap
+    Compact -- "3. DELETE Old Logs" --> DB_Log
+    Compact -- "4. SYNC Columns" --> Sidecar
 ```
 
 ### Why This Approach?
@@ -380,6 +441,8 @@ Our persistence strategy goes beyond simple "save on every keystroke." We implem
 | **Debounce + Compaction** | Balanced load, minimal loss | More complex |
 
 ### Implementation: Debounced Flushing
+
+> **Flushing** refers to the process of taking the **server's** temporary buffer of in-memory changes and writing them to the permanent database.
 
 Updates are batched into a `pendingUpdates` array and flushed after 50ms of inactivity:
 
@@ -1044,6 +1107,43 @@ AUTH_MICROSOFT_ENTRA_ID_ISSUER="https://login.microsoftonline.com/{tenant-id}/v2
 The standard `auth()` helper works great for HTTP requests, but WebSockets are tricky. The browsers' standard `WebSocket` API **does not support custom headers**, so you cannot easily pass a Bearer token.
 
 **The Solution**: When the browser initiates the WebSocket connection, it sends an HTTP `GET` request with an `Upgrade` header. This request **includes cookies**. We can use `decode` from `next-auth/jwt` to verify the session cookie manually on the server.
+
+### Authentication Sequence
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Server as Node.js Server
+    participant Auth as Auth.js / JWT
+    participant DB as Database
+
+    Browser->>Server: HTTP GET /yjs/room-1<br/>Header: Upgrade: websocket<br/>Cookie: session-token=...
+    
+    Note over Server: 1. Intercept Upgrade Request
+    
+    Server->>Server: Parse Cookie
+    Server->>Auth: Decode & Verify JWT
+    
+    alt Invalid Token
+        Auth-->>Server: null
+        Server-->>Browser: HTTP 401 Unauthorized
+        Note over Browser: Connection Closed
+    else Valid Token
+        Auth-->>Server: User Session {id, email...}
+        
+        Note over Server: 2. Check Permissions
+        Server->>DB: Query User Access (docId, userId)
+        
+        alt Authorized
+            DB-->>Server: Access Granted
+            Server-->>Browser: HTTP 101 Switching Protocols
+            Note over Browser, Server: ✅ WebSocket Established
+        else Forbidden
+            DB-->>Server: No Record
+            Server-->>Browser: HTTP 403 Forbidden
+        end
+    end
+```
 
 **Implementation: Custom Server Authentication (server.ts)**
 
