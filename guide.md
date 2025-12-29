@@ -505,6 +505,53 @@ model DocumentUpdate {
 
 > **Note**: The `onDelete: Cascade` ensures that when a Document is deleted, its snapshots and updates are automatically cleaned up.
 
+### Document Closing Workflow
+
+When closing a document (e.g., navigating away), the system ensures data consistency through a coordinated process. The [`SaveAndRedirectLink`](components/SaveAndRedirectLink.tsx:16) component triggers an explicit save via the [`POST /api/documents/[documentId]/save`](app/api/documents/[documentId]/save/route.ts:15) endpoint before navigation. This ensures CIA values and pending Yjs updates are flushed to the database. On the server side, when all clients disconnect, [`saveAndCompact()`](persistence.ts:267) is called automatically, which flushes pending updates and creates a final snapshot to guarantee durability.
+
+### Strategy: Syncing Queryable Fields (Sidecar Sync)
+
+As your application grows (e.g., adding "Likelihood", "Impact", or "Overview" views), you might be tempted to set up individual listeners for every field to keep your SQL database in sync for queries:
+
+```typescript
+// ❌ Don't do this: Maintenance nightmare & Race conditions
+yDoc.getMap('cia').observe(() => syncCIA());
+yDoc.getMap('likelihood').observe(() => syncLikelihood());
+yDoc.getMap('impact').observe(() => syncImpact());
+```
+
+**The Better Way: Sync on Compaction**
+
+Instead, hook into the **compaction/persistence flow**. Since we are already debouncing writes and periodically compacting the full state, this is the perfect moment to extract all queryable fields and update your relational columns in one atomic operation.
+
+```typescript
+// persistence.ts (Conceptual)
+async function compactDocument(docId: string, doc: Y.Doc) {
+    // 1. Get raw values from Yjs
+    const cia = doc.getMap('cia').toJSON();
+    const likelihood = doc.getMap('likelihood').toJSON();
+
+    // 2. Sync to SQL columns ATOMICALLY with the snapshot
+    await prisma.$transaction([
+        prisma.documentSnapshot.upsert({ ... }),
+        prisma.document.update({
+             where: { id: docId },
+             data: {
+                 confidentiality: cia.confidentiality,
+                 likelihoodScore: likelihood.score,
+                 // ... other queryable fields
+             }
+        })
+    ]);
+}
+```
+
+**Why this wins:**
+1.  **Natural Debouncing**: You piggyback on the existing batching logic (saving DB load).
+2.  **Atomic Consistency**: Your SQL columns always reflect a coherent snapshot of the document, never a half-updated state.
+3.  **Single Source of Truth**: One function handles the mapping between your Yjs CRDT structure and your Prisma schema.
+4.  **Works with SyncedStore**: Since SyncedStore is just Yjs under the hood, this works transparently without needing special SyncedStore observers.
+
 ---
 
 ## 6. Sidecar Architecture Patterns
@@ -813,6 +860,22 @@ export async function shutdown() {
 **Key Takeaway**: When building persistence for Yjs, distinguish between the **binary state** (CRDT) and **sidecar metadata** (SQL columns). Ensure your shutdown handlers have access to the full document object if they need to sync both.
 
 ---
+
+### Issue 8: Handling Race Conditions
+
+In a real-time distributed system, race conditions are the enemy. We explicitly handle three distinct types in this architecture:
+
+1.  **Connection Thundering Herd (Initialization Race)**
+    *   **Problem**: If 50 users join a document simultaneously (e.g., after a meeting link is shared), the server might try to load the document from the DB 50 times in parallel, wasting resources and potentially corrupting the in-memory state.
+    *   **Solution**: We implement a **Mutex pattern** using `bindStateLocks` in `server.ts`. The first connection acquires a lock and triggers the DB load. The other 49 connections await the shared promise. Once resolved, they verify `hasPersistenceAttached` is true and skip initialization, using the now-ready in-memory instance.
+
+2.  **Database Write Contention**
+    *   **Problem**: SQLite can only handle one writer at a time. Saving to the database on every single keystroke from every user would lock the DB and degrade performance.
+    *   **Solution**: We use **Debounced Flushing** (`scheduleFlush` in `persistence.ts`). Incoming updates are buffered in an in-memory array (`pendingUpdates`). The write is triggered only after 50ms of inactivity, batching hundreds of keystrokes into a single database transaction.
+
+3.  **Atomic Compaction**
+    *   **Problem**: Compacting a document involves three distinct steps: writing a new snapshot, deleting old incremental updates, and syncing sidecar data. If the server crashes between these steps, you could end up with missing updates or duplicated data.
+    *   **Solution**: We use `prisma.$transaction()` to ensure that `upsert(snapshot)`, `deleteMany(updates)`, and `update(sidecar_data)` happen **atomically**. Either all three succeed, or the database rolls back to its previous valid state.
 
 ---
 

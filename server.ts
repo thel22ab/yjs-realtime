@@ -34,6 +34,10 @@ const WEBSOCKET_PATH_PREFIX = "/yjs/";
 // ---- Persistence Configuration ----
 const PERSISTENCE_MARKER_PREFIX = "__yjs_persistence_";
 
+// Use WeakMap to track document persistence state instead of type casting
+// This prevents interference with Yjs internals
+const persistenceAttachedMap = new WeakMap<Doc, Set<string>>();
+
 /**
  * Creates a unique persistence marker for a document.
  * This marker indicates whether persistence has been attached to prevent duplicate listeners.
@@ -43,24 +47,23 @@ function createPersistenceMarker(docName: string): string {
 }
 
 /**
- * Type definition for documents that can have persistence markers attached.
- */
-interface PersistableDocument {
-    [key: string]: boolean | unknown;
-}
-
-/**
  * Checks if persistence has already been attached to a document.
  */
 function hasPersistenceAttached(doc: Doc, persistenceKey: string): boolean {
-    return (doc as unknown as PersistableDocument)[persistenceKey] === true;
+    const attachedKeys = persistenceAttachedMap.get(doc);
+    return attachedKeys?.has(persistenceKey) ?? false;
 }
 
 /**
  * Marks a document as having persistence attached.
  */
 function markPersistenceAttached(doc: Doc, persistenceKey: string): void {
-    (doc as unknown as PersistableDocument)[persistenceKey] = true;
+    const existingKeys = persistenceAttachedMap.get(doc);
+    if (existingKeys) {
+        existingKeys.add(persistenceKey);
+    } else {
+        persistenceAttachedMap.set(doc, new Set([persistenceKey]));
+    }
 }
 
 // Lock map to prevent race conditions in bindState
@@ -203,6 +206,11 @@ app.prepare().then(() => {
     // Graceful shutdown
     process.on("SIGINT", () => {
         console.log("\nShutting down...");
+        
+        // Stop accepting new connections/updates immediately
+        wss.close();
+        server.close();
+        
         persistence.shutdown().then(() => {
             process.exit(0);
         });

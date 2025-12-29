@@ -9,6 +9,7 @@
 
 import { PrismaClient } from '../prisma/generated/prisma/client';
 import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
+import * as path from 'path';
 
 /**
  * Creates a new Prisma client instance configured for SQLite.
@@ -16,9 +17,12 @@ import { PrismaBetterSqlite3 } from '@prisma/adapter-better-sqlite3';
  * @returns A configured PrismaClient instance
  */
 function createPrismaClient(): PrismaClient {
+    // Use absolute path for fallback database to avoid location issues
+    const dbPath = process.env.DATABASE_URL || `file:${path.resolve(__dirname, '../risk-assessments.db')}`;
+    
     // Prisma 7 requires a driver adapter for all databases
     const adapter = new PrismaBetterSqlite3({
-        url: process.env.DATABASE_URL || 'file:../risk-assessments.db',
+        url: dbPath,
     });
     return new PrismaClient({ adapter });
 }
