@@ -206,6 +206,11 @@ app.prepare().then(() => {
     // Graceful shutdown
     process.on("SIGINT", () => {
         console.log("\nShutting down...");
+        
+        // Stop accepting new connections/updates immediately
+        wss.close();
+        server.close();
+        
         persistence.shutdown().then(() => {
             process.exit(0);
         });

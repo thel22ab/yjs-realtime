@@ -123,17 +123,20 @@ async function flushPendingUpdates(docId: string, doc?: Y.Doc): Promise<void> {
 
     console.log(`[Flush] Flushing ${meta.pendingUpdates.length} updates for ${docId}`);
 
-    // Merge pending updates into a single blob
-    const merged = await mergePendingUpdates(meta);
+    // Capture snapshot of updates to flush
+    const updatesToFlush = [...meta.pendingUpdates];
+    const updateCount = updatesToFlush.length;
 
-    if (merged === null) {
-        return;
-    }
+    // Merge pending updates into a single blob
+    const merged = Y.mergeUpdates(updatesToFlush);
 
     try {
         await persistMergedUpdate(docId, merged);
-        // Only clear pending after successful write to prevent data loss
-        meta.pendingUpdates = [];
+        
+        // Remove only the updates we actually flushed (FIFO)
+        // This preserves any new updates that arrived during the await above
+        meta.pendingUpdates = meta.pendingUpdates.slice(updateCount);
+        
         meta.updatesSinceLastCompaction += 1;
         console.log(`[Flush] Successfully flushed update for ${docId} (${merged.byteLength} bytes)`);
 
