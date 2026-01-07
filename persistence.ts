@@ -254,8 +254,11 @@ async function compactDocument(docId: string, doc: Y.Doc): Promise<void> {
     const snapshotBuffer = Buffer.from(snapshot);
     const currentTimestamp = BigInt(Date.now());
 
-    // Get CIA values before transaction for atomicity
-    const ciaData = getCIAUpdateData(doc);
+    try {
+        console.log(`[Compaction] Executing transaction for ${docId}`);
+
+        // Get CIA values inside transaction for consistency
+        const ciaData = getCIAUpdateData(doc);
 
     try {
         console.log(`[Compaction] Executing transaction for ${docId}`);
